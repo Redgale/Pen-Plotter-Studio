@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=PenPlotter Studio
+Comment=Convert images into pen-plotter G-code with outline tracing and shading
+Exec="/path/to/PenPlotterStudio-x86_64.AppImage"
+Icon=/path/to/icon_512.png
+Categories=Graphics;2DGraphics;Engineering;
+Terminal=false
+StartupWMClass=PenPlotterStudio
