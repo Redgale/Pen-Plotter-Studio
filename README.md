@@ -77,6 +77,14 @@ and you need the real error instead of a silent window close, use
 `build_debug.bat` instead and run the resulting exe from a Command Prompt
 window (not by double-clicking) so the console stays open.
 
+**Automated releases:** every push to `main` (or a manual run of the
+*Build and Release* workflow) builds both binaries and publishes a GitHub
+Release whose version is the previous release + 0.1 — `V1.4`, `V1.5`, …
+`V1.9`, `V2.0`. The first release is `V1.4`. The tag, the release title,
+and the file names all carry that version
+(`PenPlotterStudio-V1.4-x86_64.exe`). Put `[skip ci]` in a commit message
+to push without cutting a release.
+
 **CLI only (no GUI dependencies):**
 ```bash
 pip install opencv-python-headless numpy
@@ -255,6 +263,16 @@ the grid so they don't line up. Best with a ballpoint or fine liner.
 GUI output are identical. `tools/gcode_preview.py` renders a `.gcode` file
 to a PNG (bed view, pen-down moves only) for eyeballing engine changes
 without a printer.
+
+## Troubleshooting
+
+If the preview never appears, or anything else misbehaves, the app now
+writes a full traceback to **`penplotter_error.log`** next to the app
+(repo root when run from source, next to the `.exe` when frozen) and shows
+the first line on the canvas / in a dialog. Run `python src/main.py` from a
+terminal to see errors live. Image files with non-ASCII paths, 16-bit
+PNG/TIFF, and transparent PNGs are all handled; a file that still won't
+open is reported by name.
 
 ## Known gotcha if you modify and rebuild
 

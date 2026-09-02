@@ -32,6 +32,7 @@ this module so their output stays identical.
 """
 
 import math
+import os
 import sys
 
 import cv2
@@ -42,12 +43,60 @@ import numpy as np
 # Image loading / preparation
 # --------------------------------------------------------------------------
 
+def _imread_any(path, flags=cv2.IMREAD_UNCHANGED):
+    """cv2.imread that survives non-ASCII / OneDrive / long Windows paths
+    (cv2.imread uses plain fopen and silently returns None for those).
+    Reads the bytes ourselves and decodes from memory."""
+    try:
+        data = np.fromfile(path, dtype=np.uint8)
+    except OSError as e:
+        raise FileNotFoundError(f"Could not open image file: {path} ({e})")
+    if data.size == 0:
+        raise FileNotFoundError(f"Image file is empty or unreadable: {path}")
+    img = cv2.imdecode(data, flags)
+    if img is None:
+        raise ValueError(
+            f"Could not decode image (unsupported or corrupt format): {path}")
+    return img
+
+
+def _to_uint8_gray(raw):
+    """Normalise whatever cv2 handed back (8/16-bit, 1/3/4 channel, float)
+    into a contiguous uint8 grayscale image + an optional uint8 alpha."""
+    alpha = None
+    if raw.ndim == 3 and raw.shape[2] == 4:
+        alpha = raw[:, :, 3]
+        raw = raw[:, :, :3]
+
+    if raw.dtype != np.uint8:
+        r = raw.astype(np.float32)
+        mn, mx = float(r.min()), float(r.max())
+        raw = (np.zeros_like(r, dtype=np.uint8) if mx - mn < 1e-6
+               else ((r - mn) * (255.0 / (mx - mn))).astype(np.uint8))
+        if alpha is not None and alpha.dtype != np.uint8:
+            a = alpha.astype(np.float32)
+            am = float(a.max()) or 1.0
+            alpha = (a * (255.0 / am)).astype(np.uint8)
+
+    if raw.ndim == 3 and raw.shape[2] == 3:
+        gray = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY)
+    elif raw.ndim == 3 and raw.shape[2] == 1:
+        gray = raw[:, :, 0]
+    else:
+        gray = raw
+
+    gray = np.ascontiguousarray(gray, dtype=np.uint8)
+    if alpha is not None:
+        alpha = np.ascontiguousarray(alpha, dtype=np.uint8)
+    return gray, alpha
+
+
 def _apply_tone(gray, brightness=0, contrast=1.0, gamma=1.0,
                 normalize=True, clahe=True, denoise=True):
     """Turn a raw grayscale frame into something with the local contrast a
     hatch/stipple pass can actually reproduce. Order matters: denoise ->
     stretch levels -> local contrast -> global brightness/contrast/gamma."""
-    out = gray
+    out = np.ascontiguousarray(gray, dtype=np.uint8)
 
     if denoise:
         # edge-preserving: keeps face/hair boundaries crisp while killing
@@ -86,23 +135,17 @@ def load_and_prepare(image_path, width_mm, height_mm, max_px=1100,
     Returns: gray, px_to_mm_x, px_to_mm_y, width_mm, height_mm, alpha_mask
     where alpha_mask is a bool array (True = opaque subject) or None.
     """
-    raw = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
-    if raw is None:
-        raise FileNotFoundError(f"Could not read image: {image_path}")
+    raw = _imread_any(image_path)
+    img, alpha = _to_uint8_gray(raw)
 
-    alpha = None
-    if raw.ndim == 3 and raw.shape[2] == 4:
-        bgr = raw[:, :, :3].astype(np.float32)
-        a = raw[:, :, 3].astype(np.float32) / 255.0
-        white = np.full_like(bgr, 255.0)
-        comp = bgr * a[..., None] + white * (1.0 - a[..., None])
-        img = cv2.cvtColor(comp.astype(np.uint8), cv2.COLOR_BGR2GRAY)
-        alpha = raw[:, :, 3]
-    elif raw.ndim == 3:
-        img = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY)
-    else:
-        img = raw
+    if alpha is not None:
+        # composite the subject over white so a transparent border doesn't
+        # read as pure black in the tone pass
+        a = alpha.astype(np.float32) / 255.0
+        img = (img.astype(np.float32) * a + 255.0 * (1.0 - a)).astype(np.uint8)
 
+    if img.ndim != 2:
+        raise ValueError(f"Unexpected image shape after load: {img.shape}")
     h, w = img.shape
     aspect = h / w
     if height_mm is None:

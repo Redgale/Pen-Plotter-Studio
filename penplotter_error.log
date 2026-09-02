@@ -1,0 +1,29 @@
+
+===== 2026-09-02T18:49:07.911818  [PreviewWorker] =====
+Traceback (most recent call last):
+  File "C:\claude-code\pen-plotter\Pen-Plotter-Studio-main\src\gcode_core.py", line 51, in _imread_any
+    data = np.fromfile(path, dtype=np.uint8)
+FileNotFoundError: [Errno 2] No such file or directory: 'C:/nonexistent/nope.jpg'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\claude-code\pen-plotter\Pen-Plotter-Studio-main\src\main.py", line 135, in run
+    self._run()
+    ~~~~~~~~~^^
+  File "C:\claude-code\pen-plotter\Pen-Plotter-Studio-main\src\main.py", line 149, in _run
+    gray, px_x, px_y, w_mm, h_mm, alpha_mask = core.load_and_prepare(
+                                               ~~~~~~~~~~~~~~~~~~~~~^
+        self.image_path, p["width_mm"],
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        clahe=p["clahe"], denoise=p["denoise"],
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\claude-code\pen-plotter\Pen-Plotter-Studio-main\src\gcode_core.py", line 138, in load_and_prepare
+    raw = _imread_any(image_path)
+  File "C:\claude-code\pen-plotter\Pen-Plotter-Studio-main\src\gcode_core.py", line 53, in _imread_any
+    raise FileNotFoundError(f"Could not open image file: {path} ({e})")
+FileNotFoundError: Could not open image file: C:/nonexistent/nope.jpg ([Errno 2] No such file or directory: 'C:/nonexistent/nope.jpg')
+

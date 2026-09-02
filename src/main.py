@@ -7,6 +7,7 @@ lift, no servo required) for an Ender 3 V2 style plotter conversion, with
 a live path preview and optional direct serial streaming to the machine.
 """
 
+import datetime
 import os
 import sys
 import time
@@ -49,6 +50,31 @@ def _resolve_resources_dir():
 
 
 RESOURCES_DIR = _resolve_resources_dir()
+
+
+def _log_path():
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
+        else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        return os.path.join(base, "penplotter_error.log")
+    except Exception:
+        return "penplotter_error.log"
+
+
+def log_error(where, exc_text):
+    """Append a timestamped error to a log file next to the app and echo it
+    to stderr, so a failure is never completely silent."""
+    line = f"\n===== {datetime.datetime.now().isoformat()}  [{where}] =====\n{exc_text}\n"
+    try:
+        with open(_log_path(), "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+    try:
+        sys.stderr.write(line)
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 def cv_to_qpixmap(gray_or_bgr):
@@ -106,6 +132,19 @@ class PreviewWorker(QThread):
 
     def run(self):
         try:
+            self._run()
+        except BaseException as e:                       # noqa: BLE001
+            tb = traceback.format_exc()
+            log_error("PreviewWorker", tb)
+            try:
+                self.failed.emit(f"{e}\n\n{tb}")
+            except Exception:
+                pass
+
+    def _run(self):
+        # body kept indented under a guard so run() stays the single
+        # catch-all; every exception here is logged + surfaced, never eaten
+        if True:
             p = self.params
             gray, px_x, px_y, w_mm, h_mm, alpha_mask = core.load_and_prepare(
                 self.image_path, p["width_mm"],
@@ -165,8 +204,6 @@ class PreviewWorker(QThread):
                 img_w=iw, img_h=ih,
             )
             self.finished_ok.emit(paths, canvas, stats)
-        except Exception as e:
-            self.failed.emit(f"{e}\n{traceback.format_exc()}")
 
 
 # --------------------------------------------------------------------------
@@ -603,17 +640,24 @@ class MainWindow(QMainWindow):
             "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)")
         if not path:
             return
+        try:
+            raw = core._imread_any(path)
+            img, _alpha = core._to_uint8_gray(raw)
+        except Exception as e:
+            log_error("on_load_image", traceback.format_exc())
+            QMessageBox.warning(
+                self, "Can't open that image",
+                f"{e}\n\nTry re-saving it as a normal PNG or JPG.")
+            return
         self.image_path = path
         self.file_label.setText(os.path.basename(path))
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        if img is not None:
-            thumb = cv_to_qpixmap(img).scaled(
-                self.thumb_label.width() or 320, self.thumb_label.height(),
-                Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.thumb_label.setPixmap(thumb)
-            h, w = img.shape
-            if self.lock_aspect.isChecked():
-                self.height_spin.setValue(self.width_spin.value() * h / w)
+        thumb = cv_to_qpixmap(img).scaled(
+            self.thumb_label.width() or 320, self.thumb_label.height(),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.thumb_label.setPixmap(thumb)
+        h, w = img.shape
+        if self.lock_aspect.isChecked():
+            self.height_spin.setValue(self.width_spin.value() * h / w)
         self.update_preview()
 
     def _paper_dims(self):
@@ -674,11 +718,16 @@ class MainWindow(QMainWindow):
         if self._preview_busy:
             self._preview_dirty = True
             return
+        try:
+            params = self._collect_params()
+        except Exception:
+            log_error("_collect_params", traceback.format_exc())
+            self.statusBar().showMessage("Bad settings — see penplotter_error.log", 6000)
+            return
         self._preview_busy = True
         self._preview_dirty = False
         self.statusBar().showMessage("Generating preview…")
         self.preview_btn.setEnabled(False)
-        params = self._collect_params()
         self.preview_worker = PreviewWorker(self.image_path, params)
         self.preview_worker.finished_ok.connect(self._on_preview_ready)
         self.preview_worker.failed.connect(self._on_preview_failed)
@@ -692,6 +741,14 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.update_preview)
 
     def _on_preview_ready(self, paths, canvas, stats):
+        try:
+            self._apply_preview(paths, canvas, stats)
+        except Exception as e:
+            log_error("_on_preview_ready", traceback.format_exc())
+            self.canvas_label.setText(f"Preview render failed:\n{e}")
+            self.preview_btn.setEnabled(True)
+
+    def _apply_preview(self, paths, canvas, stats):
         self.current_paths = paths
         self.current_canvas = canvas
         self.current_stats = stats
@@ -718,8 +775,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Preview updated", 3000)
 
     def _on_preview_failed(self, msg):
+        # _preview_busy is cleared by _on_preview_thread_finished (QThread's
+        # own finished signal), which always fires after run() returns
         self.preview_btn.setEnabled(True)
-        self.statusBar().showMessage("Preview failed", 4000)
+        self.statusBar().showMessage("Preview failed — see penplotter_error.log", 6000)
+        short = msg.strip().splitlines()[0] if msg.strip() else "unknown error"
+        self.canvas_label.setPixmap(QPixmap())
+        self.canvas_label.setText(
+            f"Preview failed:\n{short}\n\n"
+            f"Full details in penplotter_error.log next to the app.")
         QMessageBox.warning(self, "Preview failed", msg)
 
     def _build_gcode(self):
@@ -828,7 +892,24 @@ class MainWindow(QMainWindow):
             self.send_worker.stop()
 
 
+def _install_excepthook():
+    prev = sys.excepthook
+
+    def hook(exc_type, exc, tb):
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        log_error("uncaught", text)
+        try:
+            QMessageBox.critical(None, "PenPlotter Studio — error",
+                                 text[-3000:])
+        except Exception:
+            pass
+        prev(exc_type, exc, tb)
+
+    sys.excepthook = hook
+
+
 def main():
+    _install_excepthook()
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLE)
     app.setApplicationName(APP_NAME)
