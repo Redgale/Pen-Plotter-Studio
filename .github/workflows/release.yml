@@ -50,7 +50,7 @@ jobs:
               --specpath packaging\windows ^
               --name PenPlotterStudio-x86_64 ^
               --icon resources\icon.ico ^
-              --add-data resources;resources ^
+              --add-data "%CD%\resources;resources" ^
               src\main.py
         shell: cmd
 
