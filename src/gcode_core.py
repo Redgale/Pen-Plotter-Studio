@@ -1,24 +1,107 @@
 #!/usr/bin/env python3
-"""Core image-to-G-code pipeline for PenPlotter Studio."""
+"""
+gcode_core.py
 
-import argparse
+Shared conversion engine: raster image -> pen-plotter G-code for an
+Ender 3 V2 that uses the stock Z axis (gantry) to lift/lower the pen
+instead of a servo.
+
+Pipeline:
+  1. load_and_prepare      -- load, (composite alpha on white), resize,
+                              edge-preserving denoise, tone-map (levels
+                              stretch + CLAHE + brightness/contrast/gamma).
+  2. detect_background_mask -- fixed-range flood fill from the border so a
+                              genuinely uniform backdrop is excluded from
+                              shading without leaking across gradients into
+                              the subject.
+  3. generate_outline_paths -- Canny edges -> contours -> simplified paths.
+  4a. generate_hatch_paths  -- tone-mapped multi-angle crosshatch.
+  4b. generate_stipple_paths-- tone-mapped dot stippling (error-diffused).
+  5. order_paths            -- greedy nearest-neighbour ordering.
+  6. fit_drawing / place    -- size the drawing to fit paper AND the
+                              reachable bed area, keep it in the usable
+                              region.
+  7. paths_to_gcode         -- Z-height pen up/down (no servo, no heaters),
+                              optional vertical flip / horizontal mirror so
+                              the print reads the same way as the preview,
+                              fan-off, dot dwell, and cleanup so no pen-down
+                              move is wasted.
+
+Both the GUI (src/main.py) and the CLI (cli/image_to_gcode.py) import from
+this module so their output stays identical.
+"""
+
 import math
 import sys
 
 import cv2
 import numpy as np
 
-DEFAULT_PEN_UP_Z = 3.0
-DEFAULT_BED_WIDTH_MM = 220.0
-DEFAULT_BED_HEIGHT_MM = 220.0
-DEFAULT_UNUSABLE_RIGHT_MM = 10.0
+
+# --------------------------------------------------------------------------
+# Image loading / preparation
+# --------------------------------------------------------------------------
+
+def _apply_tone(gray, brightness=0, contrast=1.0, gamma=1.0,
+                normalize=True, clahe=True, denoise=True):
+    """Turn a raw grayscale frame into something with the local contrast a
+    hatch/stipple pass can actually reproduce. Order matters: denoise ->
+    stretch levels -> local contrast -> global brightness/contrast/gamma."""
+    out = gray
+
+    if denoise:
+        # edge-preserving: keeps face/hair boundaries crisp while killing
+        # sensor/JPEG noise that would otherwise become stray hatch marks.
+        out = cv2.bilateralFilter(out, d=7, sigmaColor=45, sigmaSpace=7)
+
+    if normalize:
+        lo, hi = np.percentile(out, (2.0, 98.0))
+        if hi - lo > 1e-3:
+            out = np.clip((out.astype(np.float32) - lo) * (255.0 / (hi - lo)),
+                          0, 255).astype(np.uint8)
+
+    if clahe:
+        out = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(8, 8)).apply(out)
+
+    if abs(contrast - 1.0) > 1e-3 or brightness:
+        out = np.clip(out.astype(np.float32) * contrast + brightness,
+                      0, 255).astype(np.uint8)
+
+    if abs(gamma - 1.0) > 1e-3:
+        inv = 1.0 / max(gamma, 1e-3)
+        lut = np.array([((i / 255.0) ** inv) * 255 for i in range(256)],
+                       dtype=np.uint8)
+        out = cv2.LUT(out, lut)
+
+    return out
 
 
-def load_and_prepare(image_path, width_mm, height_mm, max_px=900):
-    """Load, normalize, lightly denoise, and resize an image for plotting."""
-    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
+def load_and_prepare(image_path, width_mm, height_mm, max_px=1100,
+                     brightness=0, contrast=1.0, gamma=1.0,
+                     normalize=True, clahe=True, denoise=True):
+    """Load image, composite any alpha onto white, convert to grayscale,
+    resize so the longer edge is max_px, tone-map it, and compute the
+    px-per-mm scale factors for the requested output size.
+
+    Returns: gray, px_to_mm_x, px_to_mm_y, width_mm, height_mm, alpha_mask
+    where alpha_mask is a bool array (True = opaque subject) or None.
+    """
+    raw = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    if raw is None:
         raise FileNotFoundError(f"Could not read image: {image_path}")
+
+    alpha = None
+    if raw.ndim == 3 and raw.shape[2] == 4:
+        bgr = raw[:, :, :3].astype(np.float32)
+        a = raw[:, :, 3].astype(np.float32) / 255.0
+        white = np.full_like(bgr, 255.0)
+        comp = bgr * a[..., None] + white * (1.0 - a[..., None])
+        img = cv2.cvtColor(comp.astype(np.uint8), cv2.COLOR_BGR2GRAY)
+        alpha = raw[:, :, 3]
+    elif raw.ndim == 3:
+        img = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY)
+    else:
+        img = raw
 
     h, w = img.shape
     aspect = h / w
@@ -31,122 +114,133 @@ def load_and_prepare(image_path, width_mm, height_mm, max_px=900):
     else:
         new_h = max_px
         new_w = max(1, int(round(max_px / aspect)))
-    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    interp = cv2.INTER_AREA if new_w < w else cv2.INTER_CUBIC
+    img = cv2.resize(img, (new_w, new_h), interpolation=interp)
+    if alpha is not None:
+        alpha = cv2.resize(alpha, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
 
-    # Robust contrast normalization makes photos/scans much less sensitive to
-    # exposure and paper/background brightness than raw Canny input.
-    lo, hi = np.percentile(img, (1.0, 99.0))
-    if hi > lo + 1:
-        img = np.clip((img.astype(np.float32) - lo) * 255.0 / (hi - lo), 0, 255).astype(np.uint8)
+    img = _apply_tone(img, brightness, contrast, gamma, normalize, clahe, denoise)
 
-    img = cv2.GaussianBlur(img, (3, 3), 0)
+    alpha_mask = (alpha > 16) if alpha is not None else None
+
     px_to_mm_x = width_mm / new_w
     px_to_mm_y = height_mm / new_h
-    return img, px_to_mm_x, px_to_mm_y, width_mm, height_mm
+    return img, px_to_mm_x, px_to_mm_y, width_mm, height_mm, alpha_mask
 
 
-def detect_background_mask(gray, tolerance=18):
-    """Return border-connected, low-variation background pixels."""
+# --------------------------------------------------------------------------
+# Background detection
+# --------------------------------------------------------------------------
+
+def detect_background_mask(gray, tolerance=18, alpha_mask=None):
+    """Detect the "background": region(s) of near-uniform brightness that
+    touch the image border. Uses a FIXED-RANGE flood fill (every candidate
+    pixel is compared to the seed colour, not its filled neighbour) so a
+    smooth gradient -- e.g. a lit cheek fading toward a white backdrop --
+    does NOT let the fill leak into the subject the way a floating-range
+    fill does.
+
+    If the resulting mask covers more than 92% of the frame it almost
+    certainly leaked; in that case only the outer border pixels are
+    treated as background.
+
+    If alpha_mask is given (from a cut-out PNG), everything transparent is
+    background and everything opaque is kept -- no flood fill needed.
+
+    Returns a bool mask, True where a pixel is background.
+    """
     h, w = gray.shape
+
+    if alpha_mask is not None:
+        return ~alpha_mask
+
     flood_mask = np.zeros((h + 2, w + 2), np.uint8)
     work = gray.copy()
-    step_x = max(1, w // 60)
-    step_y = max(1, h // 60)
-    border_points = set()
-    for x in range(0, w, step_x):
-        border_points.add((x, 0)); border_points.add((x, h - 1))
-    for y in range(0, h, step_y):
-        border_points.add((0, y)); border_points.add((w - 1, y))
 
-    flags = 4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
-    for x, y in border_points:
+    step_x = max(1, w // 80)
+    step_y = max(1, h // 80)
+    seeds = set()
+    for x in range(0, w, step_x):
+        seeds.add((x, 0)); seeds.add((x, h - 1))
+    for y in range(0, h, step_y):
+        seeds.add((0, y)); seeds.add((w - 1, y))
+
+    flags = (4 | cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
+             | (255 << 8))
+    for (x, y) in seeds:
         if flood_mask[y + 1, x + 1] == 0:
             cv2.floodFill(work, flood_mask, (x, y), 0,
                           loDiff=tolerance, upDiff=tolerance, flags=flags)
-    return flood_mask[1:-1, 1:-1] > 0
+
+    mask = flood_mask[1:-1, 1:-1] > 0
+
+    if mask.mean() > 0.92:
+        mask = np.zeros((h, w), bool)
+        mask[0, :] = mask[-1, :] = mask[:, 0] = mask[:, -1] = True
+        return mask
+
+    # close pinholes so isolated bright specks inside the subject aren't
+    # counted as background, then drop a 1px rind back so we don't shave
+    # the subject outline.
+    m = mask.astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    return m > 0
 
 
-def _effective_canny_thresholds(gray, low, high):
-    """Convert UI/CLI thresholds into stable Canny values.
-
-    The source image is contrast-normalized first. Values 0..500 are accepted
-    for backwards compatibility. Zero is treated as 'most sensitive', but is
-    still given a small noise floor so the setting does not turn the entire
-    image into an edge map.
-    """
-    low = float(np.clip(low, 0, 500))
-    high = float(np.clip(high, 0, 500))
-    if low > high:
-        low, high = high, low
-
-    # Map the legacy 0..500 controls to useful Canny thresholds. Keep a floor
-    # and ensure a real hysteresis gap at the extremes.
-    effective_low = 3.0 + (low / 500.0) * 117.0
-    effective_high = 12.0 + (high / 500.0) * 183.0
-    if effective_high <= effective_low + 4:
-        effective_high = effective_low + 4
-    return int(round(effective_low)), int(round(min(255, effective_high)))
+def _subject_mask(gray_shape, background_mask):
+    if background_mask is None:
+        return np.ones(gray_shape, bool)
+    return ~background_mask
 
 
-def _path_length_px(path):
-    if len(path) < 2:
-        return 0.0
-    return sum(math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1])
-               for i in range(len(path) - 1))
+# --------------------------------------------------------------------------
+# Outline pass
+# --------------------------------------------------------------------------
 
-
-def simplify_and_filter_paths(paths, epsilon=1.0, min_length_px=5.0):
-    """Remove tiny/no-op paths and redundant points without changing shape."""
-    result = []
-    for path in paths:
-        if len(path) < 2 or _path_length_px(path) < min_length_px:
-            continue
-        arr = np.asarray(path, dtype=np.float32).reshape(-1, 1, 2)
-        if len(arr) > 2:
-            approx = cv2.approxPolyDP(arr, epsilon, False)
-            pts = [(float(p[0][0]), float(p[0][1])) for p in approx]
-        else:
-            pts = [(float(x), float(y)) for x, y in path]
-        if len(pts) >= 2 and _path_length_px(pts) >= min_length_px:
-            result.append(pts)
-    return result
-
-
-def generate_outline_paths(gray, low, high, min_len=6, epsilon=1.2, background_mask=None):
-    """Trace meaningful image edges while suppressing isolated noise."""
-    canny_low, canny_high = _effective_canny_thresholds(gray, low, high)
-    # A small blur plus Canny's hysteresis gives much cleaner outlines than
-    # dilating every edge pixel, which used to thicken/noisify contours.
-    edges = cv2.Canny(gray, canny_low, canny_high, apertureSize=3, L2gradient=True)
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8), iterations=1)
-    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+def generate_outline_paths(gray, low, high, min_len=6, epsilon=1.2,
+                           background_mask=None):
+    edges = cv2.Canny(gray, low, high, L2gradient=True)
+    if background_mask is not None:
+        # never trace an edge that only exists because of the backdrop
+        edges[background_mask] = 0
+    edges = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST,
+                                   cv2.CHAIN_APPROX_SIMPLE)
 
     paths = []
-    h, w = gray.shape
     for c in contours:
         if len(c) < min_len:
             continue
-        pts = [(float(p[0][0]), float(p[0][1])) for p in c]
-        if background_mask is not None and pts:
-            in_bg = 0
-            for px, py in pts[::max(1, len(pts) // 80)]:
-                xi, yi = int(round(px)), int(round(py))
-                if 0 <= xi < w and 0 <= yi < h and background_mask[yi, xi]:
-                    in_bg += 1
-            samples = max(1, len(pts[::max(1, len(pts) // 80)]))
-            if in_bg / samples > 0.80:
+        approx = cv2.approxPolyDP(c, epsilon, closed=False)
+        pts = [(float(p[0][0]), float(p[0][1])) for p in approx]
+        if len(pts) < 2:
+            continue
+        if background_mask is not None:
+            hh, ww = background_mask.shape
+            in_bg = sum(
+                1 for (px, py) in pts
+                if 0 <= int(round(px)) < ww and 0 <= int(round(py)) < hh
+                and background_mask[int(round(py)), int(round(px))]
+            )
+            if in_bg / len(pts) > 0.6:
                 continue
         paths.append(pts)
+    return paths
 
-    return simplify_and_filter_paths(paths, epsilon=epsilon, min_length_px=float(min_len))
 
+# --------------------------------------------------------------------------
+# Shading pass -- tone-mapped crosshatch
+# --------------------------------------------------------------------------
 
 def hatch_lines_for_mask(mask, angle_deg, spacing_px, sample_step=1.0):
-    """Return continuous line segments inside a boolean mask."""
+    """Parallel line segments at angle_deg, spacing_px apart, clipped to the
+    True regions of `mask`. A run is only emitted where the mask is set, so
+    the pen is never down over a region that shouldn't be inked."""
     h, w = mask.shape
     theta = math.radians(angle_deg)
     dx, dy = math.cos(theta), math.sin(theta)
     nx, ny = -math.sin(theta), math.cos(theta)
+
     corners = [(0, 0), (w, 0), (0, h), (w, h)]
     offsets = [nx * x + ny * y for x, y in corners]
     alongs = [dx * x + dy * y for x, y in corners]
@@ -155,12 +249,13 @@ def hatch_lines_for_mask(mask, angle_deg, spacing_px, sample_step=1.0):
 
     paths = []
     offset = min_off
-    while offset <= max_off + 1e-6:
+    while offset <= max_off:
         base_x, base_y = nx * offset, ny * offset
         t = min_along
         run = []
-        while t <= max_along + 1e-6:
-            x, y = base_x + dx * t, base_y + dy * t
+        while t <= max_along:
+            x = base_x + dx * t
+            y = base_y + dy * t
             xi, yi = int(round(x)), int(round(y))
             if 0 <= xi < w and 0 <= yi < h and mask[yi, xi]:
                 run.append((x, y))
@@ -171,72 +266,149 @@ def hatch_lines_for_mask(mask, angle_deg, spacing_px, sample_step=1.0):
             t += sample_step
         if len(run) > 1:
             paths.append(run)
-        offset += max(0.5, spacing_px)
+        offset += spacing_px
     return paths
 
 
-def generate_hatch_paths(gray, levels, base_spacing_px, angle_start=20, background_mask=None):
-    """Generate layered crosshatching with continuous segments only."""
+def generate_hatch_paths(gray, levels, base_spacing_px, angle_start=18,
+                         background_mask=None, dark_boost=1.0,
+                         deepen_blacks=True):
+    """Tone-mapped crosshatch.
+
+    `levels` hatch directions are laid down. A pixel receives direction k
+    (k = 0 is the first / lightest pass) only where its darkness is at
+    least (k + 0.5)/levels of full black, so mid-tones get a couple of
+    overlapping directions and shadows get all of them -- the overlap count
+    tracks image darkness monotonically. Line spacing is constant within a
+    pass, so the result is predictable as you change levels/spacing.
+    """
     if levels <= 0:
         return []
-    thresholds = [int(255 * (levels - i) / (levels + 1)) for i in range(levels)]
+    subject = _subject_mask(gray.shape, background_mask)
+
+    dark = (255 - gray.astype(np.float32)) / 255.0
+    if abs(dark_boost - 1.0) > 1e-3:
+        dark = np.clip(dark * dark_boost, 0, 1)
+
+    spacing = max(base_spacing_px, 1.2)
     paths = []
-    for i, thresh in enumerate(thresholds):
-        mask = gray < thresh
-        if background_mask is not None:
-            mask &= ~background_mask
-        angle = angle_start + i * (180.0 / (levels + 1))
-        spacing = base_spacing_px * (levels - i) / levels * 1.3 + base_spacing_px * 0.4
-        paths.extend(hatch_lines_for_mask(mask, angle, max(spacing, 1.5)))
-    return simplify_and_filter_paths(paths, epsilon=0.8, min_length_px=2.0)
+    for k in range(levels):
+        thresh = (k + 0.5) / levels
+        mask = (dark >= thresh) & subject
+        if not mask.any():
+            continue
+        angle = angle_start + k * (180.0 / levels)
+        paths.extend(hatch_lines_for_mask(mask, angle, spacing))
 
-
-def generate_dot_infill_paths(gray, spacing_px, darkness_threshold=0.08,
-                              background_mask=None, jitter=False):
-    """Generate one-point paths for halftone-style dot shading.
-
-    Dot density follows darkness: white/near-white pixels create no dots;
-    darker regions get more regular-grid positions. One-point paths are kept
-    distinct so the G-code writer can make an actual pen mark without a
-    meaningless travel line.
-    """
-    spacing_px = max(float(spacing_px), 2.0)
-    h, w = gray.shape
-    # Use a cell-average rather than one noisy pixel. This makes the dot field
-    # much more stable on photographs and scanned paper.
-    radius = max(1, int(round(spacing_px * 0.35)))
-    smooth = cv2.GaussianBlur(gray, (radius * 2 + 1, radius * 2 + 1), 0)
-    paths = []
-    row = 0
-    y = spacing_px * 0.5
-    while y < h:
-        x = spacing_px * 0.5 + (spacing_px * 0.5 if row % 2 else 0.0)
-        while x < w:
-            xi, yi = int(round(x)), int(round(y))
-            if 0 <= xi < w and 0 <= yi < h:
-                if background_mask is not None and background_mask[yi, xi]:
-                    x += spacing_px
-                    continue
-                darkness = 1.0 - smooth[yi, xi] / 255.0
-                # The expected dot probability is proportional to darkness.
-                # At very low darkness, skip entirely to avoid gray-noise ink.
-                if darkness >= darkness_threshold:
-                    probability = (darkness - darkness_threshold) / max(1e-6, 1.0 - darkness_threshold)
-                    # Deterministic threshold pattern; no RNG means previews and
-                    # exported G-code always agree.
-                    if ((xi * 73856093 + yi * 19349663) % 100000) / 100000.0 < probability:
-                        paths.append([(float(x), float(y))])
-            x += spacing_px
-        y += spacing_px * math.sqrt(3) / 2
-        row += 1
+    if deepen_blacks:
+        mask = (dark >= 0.82) & subject
+        if mask.any():
+            paths.extend(hatch_lines_for_mask(
+                mask, angle_start + 90.0, max(spacing * 0.5, 0.9)))
     return paths
 
 
-def order_paths(paths):
-    """Greedy nearest-neighbor ordering; supports both lines and dots."""
+# --------------------------------------------------------------------------
+# Shading pass -- tone-mapped dot stippling
+# --------------------------------------------------------------------------
+
+def generate_stipple_paths(gray, spacing_px, background_mask=None,
+                           dark_boost=1.0, gamma=1.0, min_gap_px=1.4,
+                           jitter=0.42, seed=1234):
+    """Dot stippling. The tone image is reduced to a grid whose cell size is
+    the *darkest-area* dot pitch; each cell's target ink coverage
+    (0..1, from local darkness) is Floyd-Steinberg error-diffused to a
+    clean on/off dot pattern, so local average tone is preserved without
+    visible banding. Dots are jittered off the grid so they don't line up.
+
+    Returns a list of single-point "paths" -- paths_to_gcode renders each
+    as one pen tap.
+    """
+    subject = _subject_mask(gray.shape, background_mask)
+    h, w = gray.shape
+    cell = max(spacing_px, 1.5)
+    gh = max(1, int(h / cell))
+    gw = max(1, int(w / cell))
+
+    small = cv2.resize(gray, (gw, gh), interpolation=cv2.INTER_AREA).astype(np.float32)
+    subj_small = cv2.resize(subject.astype(np.uint8), (gw, gh),
+                            interpolation=cv2.INTER_AREA) > 0.5
+
+    dark = (255.0 - small) / 255.0
+    if abs(gamma - 1.0) > 1e-3:
+        dark = np.power(np.clip(dark, 0, 1), 1.0 / max(gamma, 1e-3))
+    dark = np.clip(dark * dark_boost, 0.0, 1.0)
+    dark[~subj_small] = 0.0
+
+    # Floyd-Steinberg on the coverage field
+    err = dark.copy()
+    dots_grid = np.zeros((gh, gw), bool)
+    for y in range(gh):
+        for x in range(gw):
+            old = err[y, x]
+            new = 1.0 if old >= 0.5 else 0.0
+            dots_grid[y, x] = new > 0.5
+            d = old - new
+            if x + 1 < gw:
+                err[y, x + 1] += d * 7 / 16
+            if y + 1 < gh:
+                if x > 0:
+                    err[y + 1, x - 1] += d * 3 / 16
+                err[y + 1, x] += d * 5 / 16
+                if x + 1 < gw:
+                    err[y + 1, x + 1] += d * 1 / 16
+
+    rng = np.random.default_rng(seed)
+    hh, ww = background_mask.shape if background_mask is not None else (h, w)
+    dots = []
+    for gy in range(gh):
+        cols = range(gw) if gy % 2 == 0 else range(gw - 1, -1, -1)
+        for gx in cols:
+            if not dots_grid[gy, gx]:
+                continue
+            px = (gx + 0.5 + rng.uniform(-jitter, jitter)) * cell
+            py = (gy + 0.5 + rng.uniform(-jitter, jitter)) * cell
+            xi, yi = int(round(px)), int(round(py))
+            if 0 <= xi < ww and 0 <= yi < hh:
+                if background_mask is not None and background_mask[yi, xi]:
+                    continue
+            dots.append([(px, py)])
+    return dots
+
+
+# --------------------------------------------------------------------------
+# Path ordering (greedy nearest-neighbor)
+# --------------------------------------------------------------------------
+
+def _serpentine_sort(paths, band_mm_px):
+    """O(n log n) ordering: sweep the bed in horizontal bands, alternating
+    left-to-right / right-to-left each band. Near-optimal for the dense,
+    roughly-uniform path sets a portrait produces, and it doesn't blow up
+    the way the O(n^2) greedy pass does at tens of thousands of paths."""
+    def key(p):
+        xs = [pt[0] for pt in p]; ys = [pt[1] for pt in p]
+        cx = sum(xs) / len(xs); cy = sum(ys) / len(ys)
+        band = int(cy / band_mm_px)
+        return (band, cx if band % 2 == 0 else -cx)
+    out = sorted(paths, key=key)
+    # flip each path so it starts nearest the previous path's end
+    cur = None
+    for i, p in enumerate(out):
+        if cur is not None and len(p) > 1:
+            d0 = (p[0][0] - cur[0]) ** 2 + (p[0][1] - cur[1]) ** 2
+            d1 = (p[-1][0] - cur[0]) ** 2 + (p[-1][1] - cur[1]) ** 2
+            if d1 < d0:
+                out[i] = p = p[::-1]
+        cur = p[-1]
+    return out
+
+
+def order_paths(paths, band_px=24.0):
     if not paths:
-        return []
-    remaining = list(paths)
+        return paths
+    if len(paths) > 1500:
+        return _serpentine_sort(paths, band_px)
+    remaining = paths[:]
     ordered = [remaining.pop(0)]
     cur = ordered[0][-1]
     while remaining:
@@ -246,210 +418,222 @@ def order_paths(paths):
             d_end = (p[-1][0] - cur[0]) ** 2 + (p[-1][1] - cur[1]) ** 2
             if d_start < best_d:
                 best_d, best_i, best_rev = d_start, i, False
-            if d_end < best_d and len(p) > 1:
+            if d_end < best_d:
                 best_d, best_i, best_rev = d_end, i, True
         nxt = remaining.pop(best_i)
-        if best_rev:
+        if best_rev and len(nxt) > 1:
             nxt = nxt[::-1]
         ordered.append(nxt)
         cur = ordered[-1][-1]
     return ordered
 
 
-def compute_centered_origin(bed_width_mm, bed_height_mm, width_mm, height_mm,
-                            unusable_right_mm=DEFAULT_UNUSABLE_RIGHT_MM):
-    """Center within the usable area, reserving unusable_right_mm on the right."""
-    usable_width = bed_width_mm - max(0.0, unusable_right_mm)
-    origin_x = (usable_width - width_mm) / 2.0
-    origin_y = (bed_height_mm - height_mm) / 2.0
-    return origin_x, origin_y
+# --------------------------------------------------------------------------
+# Placement / fit
+# --------------------------------------------------------------------------
+
+def fit_drawing(img_w_px, img_h_px, req_width_mm, req_height_mm,
+                paper_w_mm, paper_h_mm, paper_margin_mm,
+                usable_w_mm, usable_h_mm):
+    """Return (width_mm, height_mm) for the drawing: the requested size,
+    shrunk if needed so it fits inside BOTH the sheet (minus margin) and
+    the reachable bed area. Aspect ratio is preserved when req_height_mm is
+    None; otherwise the explicit size is only scaled down uniformly."""
+    aspect = img_h_px / img_w_px
+    w = req_width_mm
+    h = req_height_mm if req_height_mm else req_width_mm * aspect
+
+    limit_w = min(usable_w_mm, max(paper_w_mm - 2 * paper_margin_mm, 1.0))
+    limit_h = min(usable_h_mm, max(paper_h_mm - 2 * paper_margin_mm, 1.0))
+
+    scale = min(1.0, limit_w / w, limit_h / h)
+    return w * scale, h * scale
 
 
-def validate_drawing_placement(origin_x, origin_y, width_mm, height_mm,
-                               bed_width_mm, bed_height_mm, unusable_right_mm=DEFAULT_UNUSABLE_RIGHT_MM):
-    """Reject drawings that would enter the reserved/right-side or bed limits."""
-    usable_right = bed_width_mm - max(0.0, unusable_right_mm)
-    if origin_x < -1e-6 or origin_y < -1e-6:
-        raise ValueError(
-            f"Drawing ({width_mm:.1f} x {height_mm:.1f} mm) is too large for the usable bed area "
-            f"({usable_right:.1f} x {bed_height_mm:.1f} mm)."
-        )
-    if origin_x + width_mm > usable_right + 1e-6 or origin_y + height_mm > bed_height_mm + 1e-6:
-        raise ValueError(
-            f"Drawing would exceed the usable bed area ({usable_right:.1f} x {bed_height_mm:.1f} mm). "
-            "Reduce the drawing size or the reserved-right value."
-        )
+def place_in_usable(width_mm, height_mm, usable_x0, usable_y0,
+                    usable_w_mm, usable_h_mm, center=True,
+                    origin_x=None, origin_y=None):
+    """Origin (drawing bottom-left in bed coords) either centered in the
+    usable rectangle or at an explicit offset, clamped so the whole drawing
+    stays inside the usable rectangle."""
+    if center or origin_x is None or origin_y is None:
+        ox = usable_x0 + (usable_w_mm - width_mm) / 2.0
+        oy = usable_y0 + (usable_h_mm - height_mm) / 2.0
+    else:
+        ox, oy = origin_x, origin_y
+    ox = min(max(ox, usable_x0), usable_x0 + max(usable_w_mm - width_mm, 0))
+    oy = min(max(oy, usable_y0), usable_y0 + max(usable_h_mm - height_mm, 0))
+    return ox, oy
 
 
-def transform_paths_for_front_view(paths, image_width_px, image_height_px,
-                                   flip_x=True, flip_y=True):
-    """Transform image coordinates so the front-view result is not inverted."""
+def compute_centered_origin(bed_width_mm, bed_height_mm, width_mm, height_mm):
+    """Back-compat helper: center a drawing on the full bed."""
+    return (bed_width_mm - width_mm) / 2.0, (bed_height_mm - height_mm) / 2.0
+
+
+# --------------------------------------------------------------------------
+# Path cleanup
+# --------------------------------------------------------------------------
+
+def _clean_paths(paths, px_to_mm_x, px_to_mm_y, min_seg_mm=0.12,
+                 min_path_mm=0.6):
+    """Drop redundant points, degenerate segments, and multi-point paths
+    too short to be worth a pen-down/up cycle. Single-point paths (stipple
+    dots) always pass through."""
     out = []
-    for path in paths:
-        transformed = []
-        for x, y in path:
-            tx = image_width_px - 1 - x if flip_x else x
-            ty = image_height_px - 1 - y if flip_y else y
-            transformed.append((tx, ty))
-        out.append(transformed)
+    for p in paths:
+        if len(p) == 1:
+            out.append(p)
+            continue
+        pruned = [p[0]]
+        for pt in p[1:]:
+            dx = (pt[0] - pruned[-1][0]) * px_to_mm_x
+            dy = (pt[1] - pruned[-1][1]) * px_to_mm_y
+            if (dx * dx + dy * dy) ** 0.5 >= min_seg_mm:
+                pruned.append(pt)
+        if len(pruned) < 2:
+            continue
+        length = 0.0
+        for i in range(len(pruned) - 1):
+            dx = (pruned[i + 1][0] - pruned[i][0]) * px_to_mm_x
+            dy = (pruned[i + 1][1] - pruned[i][1]) * px_to_mm_y
+            length += (dx * dx + dy * dy) ** 0.5
+        if length < min_path_mm:
+            continue
+        out.append(pruned)
     return out
 
 
-def _format_xy(origin_x, origin_y, px, py, px_to_mm_x, px_to_mm_y):
-    return origin_x + px * px_to_mm_x, origin_y + py * px_to_mm_y
-
+# --------------------------------------------------------------------------
+# G-code export
+# --------------------------------------------------------------------------
 
 def paths_to_gcode(paths, px_to_mm_x, px_to_mm_y, pen_up_z, pen_down_z,
-                    draw_feed, travel_feed, origin_x=0.0, origin_y=0.0,
-                    fan_off=True, park_x=0.0, park_y=0.0):
-    """Convert line and one-point dot paths to compact pen-lift G-code."""
-    lines = [
-        "; Pen plotter G-code -- generated by PenPlotter Studio",
-        "; Uses Z moves for pen up/down; no extrusion or heater commands",
-        "G21 ; mm units",
-        "G90 ; absolute positioning",
-    ]
-    if fan_off:
-        lines.append("M107 ; part-cooling fan OFF")
-    lines.append(f"G1 Z{pen_up_z:.2f} F{travel_feed} ; pen up")
-    lines.append("G28 X Y ; home X and Y")
+                   draw_feed, travel_feed, origin_x=0.0, origin_y=0.0,
+                   content_w_px=None, content_h_px=None,
+                   flip_y=True, mirror_x=False, fan_off=True,
+                   dot_dwell_ms=0, z_feed=None, home_xy=True,
+                   min_seg_mm=0.12, min_path_mm=0.6):
+    """Emit G-code. Pen up/down are Z moves (no servo, no heater commands).
 
-    pen_is_up = True
-    current_xy = None
+    flip_y   -- map image-top to the BACK of the bed so the finished print
+                reads the same way up as the on-screen preview / the source
+                image (Ender-3 Y grows toward the back).
+    mirror_x -- also mirror left<->right (for a 180 deg / mirrored machine).
+    fan_off  -- emit M107 so the part-cooling fan on the head stays off.
+    """
+    if content_h_px is None or content_w_px is None:
+        allx = [pt[0] for p in paths for pt in p] or [0.0]
+        ally = [pt[1] for p in paths for pt in p] or [0.0]
+        content_w_px = content_w_px or (max(allx) + 1)
+        content_h_px = content_h_px or (max(ally) + 1)
+
+    z_feed = z_feed or travel_feed
+    paths = _clean_paths(paths, px_to_mm_x, px_to_mm_y, min_seg_mm, min_path_mm)
+
+    def xf(px, py):
+        x = px
+        y = py
+        if mirror_x:
+            x = content_w_px - x
+        if flip_y:
+            y = content_h_px - y
+        return origin_x + x * px_to_mm_x, origin_y + y * px_to_mm_y
+
+    L = []
+    L.append("; Pen plotter G-code -- generated by PenPlotter Studio")
+    L.append("; Z moves for pen up/down (no servo, no heaters)")
+    L.append("G21 ; mm")
+    L.append("G90 ; absolute")
+    if fan_off:
+        L.append("M107 ; part-cooling fan off (unused pen-plotter head)")
+    L.append(f"G1 Z{pen_up_z:.2f} F{z_feed} ; pen up")
+    if home_xy:
+        L.append("G28 X Y ; home X/Y (comment out if already homed)")
+
+    # pen state is tracked so we never emit a redundant Z move and never
+    # drag the pen across a travel move
+    pen_up = True
+    last = None
+
+    def lift():
+        nonlocal pen_up
+        if not pen_up:
+            L.append(f"G1 Z{pen_up_z:.2f} F{z_feed}")
+            pen_up = True
+
+    def drop():
+        nonlocal pen_up
+        if pen_up:
+            L.append(f"G1 Z{pen_down_z:.2f} F{z_feed}")
+            pen_up = False
+
     for path in paths:
-        if not path:
-            continue
-        x0, y0 = _format_xy(origin_x, origin_y, path[0][0], path[0][1], px_to_mm_x, px_to_mm_y)
-
-        if not pen_is_up:
-            lines.append(f"G1 Z{pen_up_z:.2f} F{travel_feed}")
-            pen_is_up = True
-        if current_xy is None or abs(current_xy[0] - x0) > 0.005 or abs(current_xy[1] - y0) > 0.005:
-            lines.append(f"G1 X{x0:.2f} Y{y0:.2f} F{travel_feed}")
-            current_xy = (x0, y0)
-
-        lines.append(f"G1 Z{pen_down_z:.2f} F{travel_feed}")
-        pen_is_up = False
         if len(path) == 1:
-            # One-point path = one actual dot; immediately lift without a
-            # meaningless XY segment.
-            lines.append(f"G1 Z{pen_up_z:.2f} F{travel_feed}")
-            pen_is_up = True
+            x0, y0 = xf(*path[0])
+            lift()
+            L.append(f"G1 X{x0:.3f} Y{y0:.3f} F{travel_feed}")
+            drop()
+            if dot_dwell_ms > 0:
+                L.append(f"G4 P{int(dot_dwell_ms)}")
+            lift()
+            last = (x0, y0)
             continue
 
-        for px, py in path[1:]:
-            x, y = _format_xy(origin_x, origin_y, px, py, px_to_mm_x, px_to_mm_y)
-            if abs(x - current_xy[0]) > 0.005 or abs(y - current_xy[1]) > 0.005:
-                lines.append(f"G1 X{x:.2f} Y{y:.2f} F{draw_feed}")
-                current_xy = (x, y)
+        x0, y0 = xf(*path[0])
+        # skip a pointless re-draw if we're already sitting on the start
+        if last is None or (abs(last[0] - x0) > 1e-4 or abs(last[1] - y0) > 1e-4):
+            lift()
+            L.append(f"G1 X{x0:.3f} Y{y0:.3f} F{travel_feed}")
+        drop()
+        x, y = x0, y0
+        for pt in path[1:]:
+            x, y = xf(*pt)
+            L.append(f"G1 X{x:.3f} Y{y:.3f} F{draw_feed}")
+        last = (x, y)
 
-    if not pen_is_up:
-        lines.append(f"G1 Z{pen_up_z:.2f} F{travel_feed} ; pen up")
-    if fan_off:
-        lines.append("M107 ; ensure part-cooling fan remains OFF")
-    if current_xy is None or abs(current_xy[0] - park_x) > 0.005 or abs(current_xy[1] - park_y) > 0.005:
-        lines.append(f"G1 X{park_x:.2f} Y{park_y:.2f} F{travel_feed}")
-    lines.append("; end of drawing")
-    return "\n".join(lines)
+    lift()
+    L.append(f"G1 X0 Y0 F{travel_feed} ; park")
+    L.append("; end")
+    return "\n".join(L)
 
 
-def build_paths_for_image(gray, params):
-    """Shared pipeline used by GUI and CLI."""
+# --------------------------------------------------------------------------
+# One-call convenience wrapper (used by GUI worker and CLI)
+# --------------------------------------------------------------------------
+
+def build_paths(gray, alpha_mask, params):
+    """Run the enabled passes and return (paths, background_mask)."""
     background_mask = None
     if params.get("bg_detect_enabled", True):
-        background_mask = detect_background_mask(gray, params.get("bg_tolerance", 18))
+        background_mask = detect_background_mask(
+            gray, params.get("bg_tolerance", 18), alpha_mask)
+    elif alpha_mask is not None:
+        background_mask = ~alpha_mask
 
     paths = []
     if params.get("outline_enabled", True):
-        paths.extend(generate_outline_paths(
-            gray, params.get("canny_low", 50), params.get("canny_high", 150),
-            background_mask=background_mask))
+        paths += generate_outline_paths(
+            gray, params["canny_low"], params["canny_high"],
+            background_mask=background_mask)
 
-    method = params.get("shading_method", "crosshatch")
+    style = params.get("shading_style", "crosshatch")
     if params.get("shading_enabled", True):
-        spacing_px = params.get("shading_spacing_mm", params.get("hatch_spacing_mm", 1.4)) / ((params["px_x"] + params["px_y"]) / 2)
-        if method == "infill":
-            paths.extend(generate_dot_infill_paths(
-                gray, spacing_px,
-                darkness_threshold=params.get("dot_threshold", 0.08),
-                background_mask=background_mask))
-        elif params.get("shading_levels", 3) > 0:
-            paths.extend(generate_hatch_paths(
+        px_x = params["_px_x"]; px_y = params["_px_y"]
+        avg = (px_x + px_y) / 2.0
+        if style == "stipple":
+            spacing_px = params["dot_spacing_mm"] / avg
+            paths += generate_stipple_paths(
+                gray, spacing_px, background_mask=background_mask,
+                dark_boost=params.get("dark_boost", 1.0),
+                gamma=params.get("dot_gamma", 1.0))
+        elif params.get("shading_levels", 0) > 0:
+            spacing_px = params["hatch_spacing_mm"] / avg
+            paths += generate_hatch_paths(
                 gray, params["shading_levels"], spacing_px,
-                background_mask=background_mask))
+                background_mask=background_mask,
+                dark_boost=params.get("dark_boost", 1.0))
 
-    paths = order_paths(paths)
-    if params.get("front_view_correction", True):
-        paths = transform_paths_for_front_view(paths, gray.shape[1], gray.shape[0], True, True)
-    return paths
-
-
-def main():
-    ap = argparse.ArgumentParser(description="Convert an image into pen-plotter G-code.")
-    ap.add_argument("image")
-    ap.add_argument("output")
-    ap.add_argument("--width-mm", type=float, default=150.0)
-    ap.add_argument("--height-mm", type=float, default=None)
-    ap.add_argument("--pen-up-z", type=float, default=DEFAULT_PEN_UP_Z)
-    ap.add_argument("--pen-down-z", type=float, default=0.0)
-    ap.add_argument("--draw-feed", type=int, default=1500)
-    ap.add_argument("--travel-feed", type=int, default=3000)
-    ap.add_argument("--canny-low", type=int, default=50)
-    ap.add_argument("--canny-high", type=int, default=150)
-    ap.add_argument("--hatch-spacing-mm", type=float, default=1.4)
-    ap.add_argument("--shading-levels", type=int, default=3)
-    ap.add_argument("--shading-method", choices=["crosshatch", "infill"], default="crosshatch")
-    ap.add_argument("--dot-spacing-mm", type=float, default=1.8)
-    ap.add_argument("--dot-threshold", type=float, default=0.08)
-    ap.add_argument("--no-outline", action="store_true")
-    ap.add_argument("--no-bg-detect", action="store_true")
-    ap.add_argument("--bg-tolerance", type=int, default=18)
-    ap.add_argument("--bed-width-mm", type=float, default=DEFAULT_BED_WIDTH_MM)
-    ap.add_argument("--bed-height-mm", type=float, default=DEFAULT_BED_HEIGHT_MM)
-    ap.add_argument("--unusable-right-mm", type=float, default=DEFAULT_UNUSABLE_RIGHT_MM)
-    ap.add_argument("--no-center", action="store_true")
-    ap.add_argument("--origin-x", type=float, default=0.0)
-    ap.add_argument("--origin-y", type=float, default=0.0)
-    ap.add_argument("--no-front-view-correction", action="store_true")
-    args = ap.parse_args()
-
-    gray, px_x, px_y, w_mm, h_mm = load_and_prepare(args.image, args.width_mm, args.height_mm)
-    params = {
-        "outline_enabled": not args.no_outline,
-        "shading_enabled": True,
-        "bg_detect_enabled": not args.no_bg_detect,
-        "bg_tolerance": args.bg_tolerance,
-        "canny_low": args.canny_low,
-        "canny_high": args.canny_high,
-        "shading_levels": args.shading_levels,
-        "shading_method": args.shading_method,
-        "shading_spacing_mm": args.dot_spacing_mm if args.shading_method == "infill" else args.hatch_spacing_mm,
-        "dot_threshold": args.dot_threshold,
-        "px_x": px_x, "px_y": px_y,
-        "front_view_correction": not args.no_front_view_correction,
-    }
-    all_paths = build_paths_for_image(gray, params)
-    if not all_paths:
-        print("No paths generated -- try adjusting the image or sensitivity.", file=sys.stderr)
-        sys.exit(1)
-
-    if args.no_center:
-        origin_x, origin_y = args.origin_x, args.origin_y
-    else:
-        origin_x, origin_y = compute_centered_origin(
-            args.bed_width_mm, args.bed_height_mm, w_mm, h_mm, args.unusable_right_mm)
-    validate_drawing_placement(origin_x, origin_y, w_mm, h_mm,
-                               args.bed_width_mm, args.bed_height_mm, args.unusable_right_mm)
-
-    gcode = paths_to_gcode(all_paths, px_x, px_y, args.pen_up_z, args.pen_down_z,
-                           args.draw_feed, args.travel_feed, origin_x, origin_y)
-    with open(args.output, "w", encoding="utf-8") as f:
-        f.write(gcode)
-
-    total_pts = sum(len(p) for p in all_paths)
-    print(f"Wrote {args.output}: {len(all_paths)} paths, {total_pts} points")
-    print(f"Drawing area: {w_mm:.1f}mm x {h_mm:.1f}mm, usable bed width: {args.bed_width_mm - args.unusable_right_mm:.1f}mm")
-
-
-if __name__ == "__main__":
-    main()
+    if paths:
+        paths = order_paths(paths)
+    return paths, background_mask

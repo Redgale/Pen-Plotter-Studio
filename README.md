@@ -12,11 +12,25 @@ the actual pen strokes, and optional direct serial streaming to the machine.
 
 - Load any image, get a live preview of the actual paths that will be drawn
   (not just the source image) as you adjust settings.
+- Tone pipeline (auto-levels, local contrast/CLAHE, edge-preserving
+  denoise, brightness/contrast/gamma/shadow-weight) so photos —
+  not just high-contrast line art — reproduce well.
 - Outline tracing (Canny edge detection) for clean linework.
-- Adjustable multi-level crosshatch shading — darker areas get more
-  overlapping hatch directions, mimicking pencil/ink shading.
-- Dot-based **Infill** shading — a dense field of individually placed dots
-  follows image darkness, with blank regions skipped completely.
+- Two shading engines, pick one:
+  - **Crosshatch** — tone-mapped layered hatch lines; the number of
+    overlapping directions tracks image darkness.
+  - **Dots (stipple)** — error-diffused dot shading; the whole image is
+    rendered as pen taps, denser where it's darker.
+- Transparent-PNG cut-outs are detected from their alpha channel; opaque
+  JPEG backdrops via a fixed-range flood fill that doesn't leak into the
+  subject.
+- Orientation controls (vertical flip / horizontal mirror) so the print
+  comes off the bed the same way up as the preview, plus per-side
+  unusable-margin fields and paper-size presets that keep every move
+  inside the reachable area.
+- Emits `M107` so the head fan stays off, tracks pen state so no pen-down
+  move is wasted, and drops hatch fragments too short to be worth a
+  pen lift.
 - Export standalone `.gcode`, or stream it straight to the machine over
   serial with a progress bar and live log.
 - Runs on Linux (AppImage) and Windows (`.exe`); source is plain
@@ -26,7 +40,8 @@ the actual pen strokes, and optional direct serial streaming to the machine.
 
 ```
 src/                    the application (main.py, gcode_core.py, theme.py)
-cli/                    standalone command-line version, no GUI/Qt required
+cli/                    command-line front-end (imports src/gcode_core.py)
+tools/                  gcode_preview.py -- render a .gcode to PNG (dev aid)
 resources/              icons (png + ico)
 packaging/linux/        build_appimage.sh -> PenPlotterStudio-x86_64.AppImage
 packaging/windows/      build.bat / build_debug.bat -> PenPlotterStudio.exe
@@ -64,85 +79,137 @@ window (not by double-clicking) so the console stays open.
 
 **CLI only (no GUI dependencies):**
 ```bash
-pip install opencv-python numpy
-python cli/image_to_gcode.py input.jpg output.gcode --width-mm 150
+pip install opencv-python-headless numpy
+python cli/image_to_gcode.py input.jpg output.gcode --width-mm 180
+python cli/image_to_gcode.py photo.jpg dots.gcode --shading stipple --no-outline
 ```
-Same conversion engine, scriptable, useful for batch jobs. Run
-`--help` for all flags.
+The CLI imports the same engine from `src/gcode_core.py` that the GUI uses,
+so output is identical. Run `--help` for all flags.
 
 ## Hardware assumption
 
 This targets a plotter conversion that uses the machine's **existing Z
 axis** to lift/lower the pen (no servo). Because the G-code this produces
 never sends a heater command, stock Marlin's thermal-runaway protection is
-never triggered — no firmware changes needed on a typical Ender 3 V2.
+never triggered — no firmware changes needed on a typical Ender 3 V2. The
+output also sends `M107` so the part-cooling fan on the (now unused)
+hot-end assembly doesn't spin during a draw.
+
+Defaults assume A4 on a 220 × 220 bed with the right ~10 mm (past X = 210)
+left unusable; all of that is adjustable in **Paper & Placement** and
+**Bed & Unusable Margins**.
 
 ---
 
 ## Settings reference
 
 ### Source Image
-**Load Image…** — opens a file picker (PNG/JPG/BMP/TIFF). This is the only
-required input; everything else has a sensible default.
+**Load Image…** — opens a file picker (PNG/JPG/BMP/TIFF/WebP). This is the
+only required input; everything else has a sensible default. A transparent
+PNG cut-out is used directly as the subject mask.
 
-### Drawing Size
+### Paper & Placement
 | Setting | Range | Default | What it does |
 |---|---|---|---|
-| Width | 10–500 mm | 150 | Physical width of the output drawing. |
-| Height | 10–500 mm | 150 | Physical height. Disabled while aspect lock is on. |
-| Lock aspect ratio | — | on | When on, Height is computed automatically from the source image's proportions. Turn off to intentionally stretch/squash. |
-| Bed origin X / Y | 0–300 mm | 0 / 0 | Manual origin when centering is disabled. |
-| Reserved right side | 0–100 mm | 10 | Area at the right side of the 220 mm plate that is never used for drawing. |
+| Paper | preset list | A4 portrait | Sheet size. `Custom / whole bed` ignores paper and uses the whole reachable bed. |
+| Max width / Max height | 10–500 mm | 180 | Upper bound on drawing size. The drawing is scaled down (aspect preserved when the lock is on) so it fits **both** the sheet minus the margin **and** the reachable bed area — so a portrait A4 request that would be 268 mm tall is quietly capped at the ~220 mm the machine can reach. |
+| Lock aspect ratio | — | on | Off = use the explicit Max height, uniform-scaled to fit. |
+| Margin from paper edge | 0–100 mm | 10 | Keep-out band between the drawing and the paper edge. |
+
+### Bed & Unusable Margins
+| Setting | Range | Default | What it does |
+|---|---|---|---|
+| Bed width / height | 10–1000 mm | 220 / 220 | Physical bed travel. |
+| Unusable left / right / front / back | 0–200 mm | 0 / 10 / 0 / 0 | Strips the head can't reach or shouldn't enter. Default clears the 10 mm dead column past X = 210 on a typical Ender 3 V2. The drawing is centered in whatever rectangle is left. |
+| Center in reachable area | — | on | Off = place the drawing at an explicit Origin X / Y (still clamped inside the reachable rectangle). |
+
+### Orientation
+| Setting | Default | What it does |
+|---|---|---|
+| Flip vertical so the print matches the preview | on | The Ender 3's +Y is toward the back. With this on, the top of the image is sent to the back of the bed, so the finished drawing reads right-side-up when you look at the machine from the front — and the exported file still previews right-side-up in a G-code viewer. Turn it off only if your machine's Y is inverted. |
+| Mirror horizontal | off | Also flips left↔right, for a machine that comes out mirrored (effectively a 180° rotation when combined with the vertical flip off). |
 
 ### Pen Z Calibration (Z-axis lift, no servo)
 | Setting | Range | Default | What it does |
 |---|---|---|---|
-| Pen up Z | 0–50 mm | 3 | Height the machine parks at between strokes / while repositioning. Must clear the paper. |
-| Pen down Z | -10–50 mm | 0 | Height where the pen tip touches paper with the right pressure. **This is specific to your pen and holder** — don't trust the default. Use the **Pen Up / Pen Down** jog buttons in the Connection panel, on real paper, to find the right value before drawing anything you care about. |
+| Pen up Z (hop) | 0–50 mm | **3** | Height the pen lifts to between strokes / dots. Must clear the paper; 3 mm is plenty for flat paper and keeps dot mode fast. |
+| Pen down Z | -10–50 mm | 0 | Height where the pen tip touches paper with the right pressure. **Specific to your pen and holder** — use the **Pen Up / Pen Down** jog buttons on real paper to find it. |
+
+### Tone / Image Recognition
+Run before any pass. This is what makes photos (not just line art)
+reproduce; sweeping the outline sensitivity alone never touched shading.
+
+| Setting | Range | Default | What it does |
+|---|---|---|---|
+| Brightness | -120–120 | 0 | Flat add to every pixel after the automatic steps. |
+| Contrast | 0.3–3.0 | 1.0 | Multiplier around mid-grey. |
+| Gamma | 0.3–3.0 | 1.0 | <1 lifts shadows, >1 deepens them. |
+| Shadow weight | 0.5–2.0 | 1.0 | Scales how strongly darkness drives hatch layering / dot density without changing the tone image itself. |
+| Auto levels | — | on | Stretches the 2nd–98th brightness percentiles to full range — fixes flat, hazy phone photos. |
+| Local contrast (CLAHE) | — | on | Adaptive local histogram equalization — pulls detail out of shadow and highlight at once. |
+| Edge-preserving denoise | — | on | Bilateral filter: kills JPEG/sensor noise that would otherwise become stray marks, without softening real edges. |
+
+### Background Detection
+| Setting | Range | Default | What it does |
+|---|---|---|---|
+| Enable | — | on | Excludes a uniform backdrop that touches the image border from shading. |
+| Sensitivity | 1–100 | 18 | Brightness tolerance for the flood fill. It's a **fixed-range** fill (every pixel compared to the border colour, not its neighbour), so it no longer leaks across a gradient into a light subject the way the old build did. If it still eats more than 92% of the frame it's ignored and only the outer border is treated as background. |
 
 ### Outline Tracing
-Uses a Canny edge detector to find and trace clean outlines, then simplifies
-each traced line to cut down the point count.
-
 | Setting | Range | Default | What it does |
 |---|---|---|---|
-| Enable (checkbox on the group title) | — | on | Turn outline tracing off entirely for shading-only output. |
-| Edge sensitivity (low) | 0–500 | 50 | Canny's lower threshold. Pixels below this gradient strength are never treated as edges. |
-| Edge sensitivity (high) | 0–500 | 150 | Canny's upper threshold. Pixels above this are always treated as edges; pixels between low and high only count if connected to one. |
+| Enable | — | on | Turn off for shading-only output. |
+| Edge sensitivity (low) | 0–500 | 60 | Canny lower threshold. |
+| Edge sensitivity (high) | 0–500 | 140 | Canny upper threshold. |
 
-**Tuning tip:** lower both values to catch fainter/more detail (more lines,
-more noise); raise both to keep only strong, confident edges (cleaner, but
-may drop subtle detail).
+Lower both to catch fainter detail (more noise); raise both for only
+strong edges. Edges that fall inside the detected background are dropped.
 
 ### Shading
-Builds shading from layered hatch lines: darker regions of the image get
-more overlapping line directions stacked on top of each other, the way a
-pencil illustrator crosshatches for shadow.
+Pick **one** engine with the Style dropdown.
+
+**Crosshatch** — `levels` hatch directions are laid down; a pixel gets
+direction *k* only where its darkness reaches *(k + 0.5) / levels* of full
+black, so mid-tones get a couple of overlapping directions and shadows get
+all of them. Spacing is constant within a pass, so the result stays
+predictable as you change the knobs. A tighter extra pass fills near-black.
 
 | Setting | Range | Default | What it does |
 |---|---|---|---|
-| Enable (checkbox on the group title) | — | on | Turn shading off for outline-only line art. |
-| Method | Crosshatch / Infill (dots) | Crosshatch | Crosshatch uses layered lines; Infill uses individual dots whose density follows darkness. |
-| Hatch levels | 0–6 | 3 | Number of overlapping hatch directions for Crosshatch. |
-| Hatch spacing | 0.4–5.0 mm | 1.4 | Gap between Crosshatch lines. |
-| Dot spacing | 0.6–6.0 mm | 1.8 | Candidate spacing for Infill dots. Smaller = more dots and darker/smoother shading. |
-| Dot darkness threshold | 0–0.8 | 0.08 | Darkness below this value produces no dot, preventing ink in near-white areas. |
+| Hatch levels | 1–8 | 4 | Number of overlapping hatch directions. More = smoother tone, bigger file. |
+| Hatch spacing | 0.4–6.0 mm | 1.0 | Gap between parallel lines in one pass. Smaller = darker; the biggest lever on overall density. |
 
-### Motion
+**Dots (stipple)** — the whole image is rendered as pen taps. The tone
+image is reduced to a grid at the darkest-area dot pitch, each cell's
+target ink coverage is Floyd–Steinberg error-diffused to a clean on/off
+pattern (local tone is preserved, no banding), and dots are jittered off
+the grid so they don't line up. Best with a ballpoint or fine liner.
+
 | Setting | Range | Default | What it does |
 |---|---|---|---|
-| Draw feed | 100–8000 mm/min | 1500 | Speed while the pen is down and drawing. Slower = cleaner lines through curves; faster = quicker draws but risk of skipping/vibration. |
-| Travel feed | 100–12000 mm/min | 3000 | Speed for pen-up repositioning moves and Z moves. Can be much faster than draw feed since nothing's touching the paper. |
+| Dot pitch (darkest) | 0.3–4.0 mm | 0.7 | Spacing between dots in the blackest areas; everything lighter is sparser. Smaller = darker, denser, **many** more taps. |
+| Dot tone gamma | 0.3–3.0 | 1.0 | <1 makes mid-tones dottier, >1 reserves dots for the true shadows. |
+| Dot dwell | 0–500 ms | 0 | Pause with the pen down at each dot. A ballpoint usually marks instantly (leave at 0); bump to ~15–30 ms if a stiff pen skips. Adds up over thousands of dots. |
+
+> Stipple mode is a lot of individual pen-up/down cycles. Expect large
+> files and long runs; keep Pen up Z low (the default 3 mm) and the dot
+> pitch no smaller than you need.
+
+### Motion & Output
+| Setting | Range | Default | What it does |
+|---|---|---|---|
+| Draw feed | 100–8000 mm/min | 1500 | Speed with the pen down. |
+| Travel feed | 100–12000 mm/min | 3000 | Speed for pen-up moves and Z hops. |
+| Head fan off (M107) | — | on | Emits `M107` at the start so the part-cooling fan on the (unused) hot-end stays off. |
+| Home X/Y at start (G28 X Y) | — | on | Homes X and Y before drawing. Turn off if you home manually / from a jig. |
 
 ### Preview / Export
-- **Update Preview** — forces an immediate regeneration (auto-updates ~400ms
-  after any setting change anyway; this just skips the wait).
-- The stats line under the canvas shows path/point counts, total line
-  length, and an **estimated draw time** — this is `line length ÷ draw feed`
-  only, so it doesn't account for travel moves or acceleration; real time
-  will run somewhat longer.
-- **Export G-code…** — saves the currently previewed paths to a `.gcode`
-  file.
+- **Update Preview** — forces an immediate regeneration (auto-updates
+  ~450 ms after any change anyway).
+- The stats line shows path/point/dot counts, line length, drawing size
+  and origin, and a draw-time estimate that now **includes** pen-up travel,
+  Z hops and dot dwell (still ignores acceleration, so treat it as a floor).
+- **Export G-code…** — saves the currently previewed paths.
 
 ### Send to Machine
 | Control | What it does |
@@ -160,22 +227,34 @@ pencil illustrator crosshatches for shadow.
 
 ## How the conversion works (for contributors)
 
-1. **Outline pass** — Canny edge detection → `cv2.findContours` → each
-   contour simplified with `approxPolyDP` to cut point count.
-2. **Shading pass** — the image is split into brightness bands; each band
-   gets a hatch-line pass at a different angle and spacing (`gcode_core.
-   generate_hatch_paths`), so darker bands accumulate more overlapping
-   directions.
-3. **Path ordering** — a greedy nearest-neighbor pass (`order_paths`)
-   reorders and optionally reverses paths to cut down on pen-up travel
-   distance.
-4. **G-code export** — straight `G1` moves for both draw and pen-lift (no
-   `G0`, no `M280` servo commands, no heater commands), so it runs on
-   unmodified Marlin.
+1. **Tone** (`load_and_prepare` → `_apply_tone`) — composite alpha on
+   white, resize, bilateral denoise, percentile levels stretch, CLAHE,
+   then brightness/contrast/gamma.
+2. **Background** (`detect_background_mask`) — alpha channel if present,
+   else a fixed-range border flood fill with a >92%-coverage sanity
+   fallback.
+3. **Outline pass** (`generate_outline_paths`) — Canny → `findContours`
+   → `approxPolyDP`, background edges removed.
+4. **Shading pass** — `generate_hatch_paths` (tone-gated multi-angle
+   hatch) **or** `generate_stipple_paths` (grid + Floyd–Steinberg error
+   diffusion + jitter, emitted in serpentine order).
+5. **Path ordering** (`order_paths`) — greedy nearest-neighbour under
+   ~1500 paths, an O(n log n) serpentine band sort above that (a portrait
+   is tens of thousands of paths).
+6. **Fit & place** (`fit_drawing`, `place_in_usable`) — scale to fit
+   paper ∩ reachable bed, centre in the reachable rectangle.
+7. **G-code export** (`paths_to_gcode`) — `G21/G90`, optional `M107` and
+   `G28 X Y`, straight `G1` moves only (no `G0`, no `M280`, no heater
+   commands). Optional Y flip / X mirror in the pixel→bed mapping, pen
+   state tracked so no Z move or travel is redundant, single-point paths
+   become dot taps (with optional `G4` dwell). `_clean_paths` drops
+   sub-0.6 mm fragments and duplicate points first.
 
-`src/gcode_core.py` and `cli/image_to_gcode.py` share this logic; the GUI in
-`src/main.py` imports the same functions the CLI script uses, so behavior
-stays identical between the two.
+`cli/image_to_gcode.py` adds `src/` to `sys.path` and imports
+`gcode_core` — the exact module the GUI (`src/main.py`) uses — so CLI and
+GUI output are identical. `tools/gcode_preview.py` renders a `.gcode` file
+to a PNG (bed view, pen-down moves only) for eyeballing engine changes
+without a printer.
 
 ## Known gotcha if you modify and rebuild
 
