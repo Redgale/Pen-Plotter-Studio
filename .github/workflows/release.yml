@@ -1,47 +1,36 @@
 name: Build and Release
-
 on:
   push:
-    tags:
-      - "v*"
-      - "V*"
-
+    branches:
+      - main
 jobs:
   build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install FUSE (needed for appimagetool)
         run: |
           sudo apt-get update
           sudo apt-get install -y libfuse2 libegl1 libxkbcommon0
-
       - name: Build AppImage
         run: bash packaging/linux/build_appimage.sh
-
       - uses: actions/upload-artifact@v4
         with:
           name: linux-appimage
           path: packaging/linux/PenPlotterStudio-x86_64.AppImage
-
   build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: python -m pip install -r packaging\windows\requirements.txt
         shell: cmd
-
       - name: Build exe
         run: |
           python -m PyInstaller --noconfirm --onefile --windowed ^
@@ -53,12 +42,10 @@ jobs:
               --add-data "%CD%\resources;resources" ^
               "%CD%\src\main.py"
         shell: cmd
-
       - uses: actions/upload-artifact@v4
         with:
           name: windows-exe
           path: packaging/windows/dist/PenPlotterStudio-x86_64.exe
-
   release:
     needs: [build-linux, build-windows]
     runs-on: ubuntu-latest
@@ -68,10 +55,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: build-${{ github.run_number }}
           files: |
             artifacts/linux-appimage/PenPlotterStudio-x86_64.AppImage
             artifacts/windows-exe/PenPlotterStudio-x86_64.exe
