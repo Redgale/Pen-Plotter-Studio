@@ -7,7 +7,7 @@ set SCRIPT_DIR=%~dp0
 set REPO_ROOT=%SCRIPT_DIR%..\..
 
 echo ============================================
-echo   PenPlotter Studio - DEBUG build
+echo   PenPlotter Studio - DEBUG build V1.4
 echo ============================================
 echo.
 
