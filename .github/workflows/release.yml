@@ -49,9 +49,9 @@ jobs:
               --workpath packaging\windows\build ^
               --specpath packaging\windows ^
               --name PenPlotterStudio-x86_64 ^
-              --icon resources\icon.ico ^
+              --icon "%CD%\resources\icon.ico" ^
               --add-data "%CD%\resources;resources" ^
-              src\main.py
+              "%CD%\src\main.py"
         shell: cmd
 
       - uses: actions/upload-artifact@v4
