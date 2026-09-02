@@ -86,12 +86,16 @@ class PreviewWorker(QThread):
                 self.image_path, p["width_mm"], p["height_mm"]
             )
 
+            background_mask = None
+            if p["bg_detect_enabled"]:
+                background_mask = core.detect_background_mask(gray, p["bg_tolerance"])
+
             paths = []
             if p["outline_enabled"]:
-                paths += core.generate_outline_paths(gray, p["canny_low"], p["canny_high"])
+                paths += core.generate_outline_paths(gray, p["canny_low"], p["canny_high"], background_mask=background_mask)
             if p["shading_enabled"] and p["shading_levels"] > 0:
                 spacing_px = p["hatch_spacing_mm"] / ((px_x + px_y) / 2)
-                paths += core.generate_hatch_paths(gray, p["shading_levels"], spacing_px)
+                paths += core.generate_hatch_paths(gray, p["shading_levels"], spacing_px, background_mask=background_mask)
 
             if paths:
                 paths = core.order_paths(paths)
@@ -285,10 +289,18 @@ class MainWindow(QMainWindow):
         sf.addRow("Width", self.width_spin)
         sf.addRow("Height", self.height_spin)
         sf.addRow(self.lock_aspect)
-        self.origin_x = QDoubleSpinBox(); self.origin_x.setRange(0, 300); self.origin_x.setValue(10); self.origin_x.setSuffix(" mm")
-        self.origin_y = QDoubleSpinBox(); self.origin_y.setRange(0, 300); self.origin_y.setValue(10); self.origin_y.setSuffix(" mm")
+        self.bed_width = QDoubleSpinBox(); self.bed_width.setRange(10, 1000); self.bed_width.setValue(220); self.bed_width.setSuffix(" mm")
+        self.bed_height = QDoubleSpinBox(); self.bed_height.setRange(10, 1000); self.bed_height.setValue(220); self.bed_height.setSuffix(" mm")
+        sf.addRow("Plate width", self.bed_width)
+        sf.addRow("Plate height", self.bed_height)
+        self.center_on_bed = QCheckBox("Center on plate"); self.center_on_bed.setChecked(True)
+        sf.addRow(self.center_on_bed)
+        self.origin_x = QDoubleSpinBox(); self.origin_x.setRange(0, 1000); self.origin_x.setValue(10); self.origin_x.setSuffix(" mm")
+        self.origin_y = QDoubleSpinBox(); self.origin_y.setRange(0, 1000); self.origin_y.setValue(10); self.origin_y.setSuffix(" mm")
         sf.addRow("Bed origin X", self.origin_x)
         sf.addRow("Bed origin Y", self.origin_y)
+        self.origin_x.setEnabled(False)
+        self.origin_y.setEnabled(False)
         sv.addWidget(size_group)
 
         # Pen Z group
@@ -303,6 +315,20 @@ class MainWindow(QMainWindow):
         hint.setStyleSheet("color:#8b8fa3; font-size:11px;")
         pf.addRow(hint)
         sv.addWidget(pen_group)
+
+        # Background detection group
+        bg_group = QGroupBox("Background Detection")
+        bg_group.setCheckable(True)
+        bg_group.setChecked(True)
+        self.bg_group = bg_group
+        bgf = QFormLayout(bg_group)
+        self.bg_tolerance = QSpinBox(); self.bg_tolerance.setRange(1, 100); self.bg_tolerance.setValue(18)
+        bgf.addRow("Sensitivity", self.bg_tolerance)
+        bg_hint = QLabel("Excludes uniform backdrop (paper, wall, solid color) touching the image edges from shading, so it isn't hatched.")
+        bg_hint.setWordWrap(True)
+        bg_hint.setStyleSheet("color:#8b8fa3; font-size:11px;")
+        bgf.addRow(bg_hint)
+        sv.addWidget(bg_group)
 
         # Outline group
         outline_group = QGroupBox("Outline Tracing")
@@ -440,14 +466,16 @@ class MainWindow(QMainWindow):
         self.jog_down_btn.clicked.connect(lambda: self.on_jog(self.pen_down.value()))
 
         self.lock_aspect.toggled.connect(lambda v: self.height_spin.setEnabled(not v))
+        self.center_on_bed.toggled.connect(lambda v: (self.origin_x.setEnabled(not v), self.origin_y.setEnabled(not v)))
 
         # Debounced auto-preview on parameter changes
         for w in [self.width_spin, self.height_spin, self.canny_low, self.canny_high,
-                  self.shading_levels, self.hatch_spacing]:
+                  self.shading_levels, self.hatch_spacing, self.bg_tolerance]:
             if isinstance(w, (QDoubleSpinBox, QSpinBox)):
                 w.valueChanged.connect(self._schedule_preview)
         self.outline_group.toggled.connect(self._schedule_preview)
         self.shade_group.toggled.connect(self._schedule_preview)
+        self.bg_group.toggled.connect(self._schedule_preview)
 
     def _schedule_preview(self, *_):
         if self.image_path:
@@ -481,6 +509,8 @@ class MainWindow(QMainWindow):
             height_mm=None if self.lock_aspect.isChecked() else self.height_spin.value(),
             outline_enabled=self.outline_group.isChecked(),
             shading_enabled=self.shade_group.isChecked(),
+            bg_detect_enabled=self.bg_group.isChecked(),
+            bg_tolerance=self.bg_tolerance.value(),
             canny_low=self.canny_low.value(),
             canny_high=self.canny_high.value(),
             shading_levels=self.shading_levels.value(),
@@ -489,6 +519,9 @@ class MainWindow(QMainWindow):
             pen_down_z=self.pen_down.value(),
             draw_feed=self.draw_feed.value(),
             travel_feed=self.travel_feed.value(),
+            bed_width_mm=self.bed_width.value(),
+            bed_height_mm=self.bed_height.value(),
+            center_on_bed=self.center_on_bed.isChecked(),
             origin_x=self.origin_x.value(),
             origin_y=self.origin_y.value(),
         )
@@ -545,14 +578,27 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Preview failed", 4000)
         QMessageBox.warning(self, "Preview failed", msg)
 
+    def _resolve_origin(self, p, stats):
+        if p["center_on_bed"]:
+            origin_x, origin_y = core.compute_centered_origin(
+                p["bed_width_mm"], p["bed_height_mm"], stats["width_mm"], stats["height_mm"]
+            )
+            if origin_x < 0 or origin_y < 0:
+                self.statusBar().showMessage(
+                    "Warning: drawing is larger than the plate -- it will run off the edge.", 6000
+                )
+            return origin_x, origin_y
+        return p["origin_x"], p["origin_y"]
+
     def _build_gcode(self):
         p = self._collect_params()
         stats = self.current_stats
+        origin_x, origin_y = self._resolve_origin(p, stats)
         gcode = core.paths_to_gcode(
             self.current_paths, stats["px_x"], stats["px_y"],
             p["pen_up_z"], p["pen_down_z"],
             p["draw_feed"], p["travel_feed"],
-            p["origin_x"], p["origin_y"],
+            origin_x, origin_y,
         )
         return gcode
 

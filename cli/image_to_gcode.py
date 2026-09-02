@@ -68,10 +68,48 @@ def load_and_prepare(image_path, width_mm, height_mm, max_px=900):
 
 
 # --------------------------------------------------------------------------
+# Background detection
+# --------------------------------------------------------------------------
+
+def detect_background_mask(gray, tolerance=18):
+    """Detect the "background" of the image as the region(s) of roughly
+    uniform brightness that are connected to the image border. Flood-fills
+    inward from sample points along the border with the given brightness
+    tolerance, so a plain/near-uniform backdrop (paper, wall, solid color)
+    gets excluded from shading regardless of its own brightness -- only
+    border-connected, low-variation areas count as background, so a subject
+    that merely happens to be light or dark is not treated as background.
+
+    Returns a boolean mask, True where a pixel is considered background.
+    """
+    h, w = gray.shape
+    flood_mask = np.zeros((h + 2, w + 2), np.uint8)
+    work = gray.copy()
+
+    step_x = max(1, w // 60)
+    step_y = max(1, h // 60)
+    border_points = set()
+    for x in range(0, w, step_x):
+        border_points.add((x, 0))
+        border_points.add((x, h - 1))
+    for y in range(0, h, step_y):
+        border_points.add((0, y))
+        border_points.add((w - 1, y))
+
+    flags = 4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
+    for (x, y) in border_points:
+        if flood_mask[y + 1, x + 1] == 0:
+            cv2.floodFill(work, flood_mask, (x, y), 0,
+                           loDiff=tolerance, upDiff=tolerance, flags=flags)
+
+    return flood_mask[1:-1, 1:-1] > 0
+
+
+# --------------------------------------------------------------------------
 # Outline pass
 # --------------------------------------------------------------------------
 
-def generate_outline_paths(gray, low, high, min_len=6, epsilon=1.2):
+def generate_outline_paths(gray, low, high, min_len=6, epsilon=1.2, background_mask=None):
     edges = cv2.Canny(gray, low, high)
     edges = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
     contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
@@ -82,8 +120,18 @@ def generate_outline_paths(gray, low, high, min_len=6, epsilon=1.2):
             continue
         approx = cv2.approxPolyDP(c, epsilon, closed=False)
         pts = [(float(p[0][0]), float(p[0][1])) for p in approx]
-        if len(pts) >= 2:
-            paths.append(pts)
+        if len(pts) < 2:
+            continue
+        if background_mask is not None:
+            h, w = background_mask.shape
+            in_bg = 0
+            for (px, py) in pts:
+                xi, yi = int(round(px)), int(round(py))
+                if 0 <= xi < w and 0 <= yi < h and background_mask[yi, xi]:
+                    in_bg += 1
+            if in_bg / len(pts) > 0.85:
+                continue
+        paths.append(pts)
     return paths
 
 
@@ -131,10 +179,11 @@ def hatch_lines_for_mask(mask, angle_deg, spacing_px, sample_step=1.0):
     return paths
 
 
-def generate_hatch_paths(gray, levels, base_spacing_px, angle_start=20):
+def generate_hatch_paths(gray, levels, base_spacing_px, angle_start=20, background_mask=None):
     """Layered crosshatch: darker brightness bands get an extra hatch
     direction added on top (so the darkest areas end up with the most
-    overlapping line directions = visually darkest)."""
+    overlapping line directions = visually darkest). Pixels covered by
+    `background_mask` are excluded so a uniform backdrop never gets hatched."""
     h, w = gray.shape
     # brightness thresholds splitting 0..255 into `levels` bands, darkest first
     thresholds = [int(255 * (i + 1) / (levels + 1)) for i in range(levels)]
@@ -144,6 +193,8 @@ def generate_hatch_paths(gray, levels, base_spacing_px, angle_start=20):
     paths = []
     for i, thresh in enumerate(thresholds):
         mask = gray < thresh
+        if background_mask is not None:
+            mask = mask & ~background_mask
         angle = angle_start + i * (180.0 / (levels + 1))
         spacing = base_spacing_px * (levels - i) / levels * 1.3 + base_spacing_px * 0.4
         level_paths = hatch_lines_for_mask(mask, angle, max(spacing, 1.5))
@@ -176,6 +227,19 @@ def order_paths(paths):
         ordered.append(nxt)
         cur = ordered[-1][-1]
     return ordered
+
+
+# --------------------------------------------------------------------------
+# Placement
+# --------------------------------------------------------------------------
+
+def compute_centered_origin(bed_width_mm, bed_height_mm, width_mm, height_mm):
+    """Origin (bottom-left of the drawing) that centers a width_mm x height_mm
+    drawing on a bed_width_mm x bed_height_mm plate (which is where a sheet of
+    paper centered on the plate would be)."""
+    origin_x = (bed_width_mm - width_mm) / 2.0
+    origin_y = (bed_height_mm - height_mm) / 2.0
+    return origin_x, origin_y
 
 
 # --------------------------------------------------------------------------
@@ -230,8 +294,13 @@ def main():
     ap.add_argument("--hatch-spacing-mm", type=float, default=1.4, help="base spacing between hatch lines, in mm")
     ap.add_argument("--shading-levels", type=int, default=3, help="number of crosshatch layers (0 = outlines only)")
     ap.add_argument("--no-outline", action="store_true", help="skip the edge/outline pass")
-    ap.add_argument("--origin-x", type=float, default=10.0, help="X offset of drawing origin on the bed (mm)")
-    ap.add_argument("--origin-y", type=float, default=10.0, help="Y offset of drawing origin on the bed (mm)")
+    ap.add_argument("--no-bg-detect", action="store_true", help="disable background detection (background will be shaded like any other region)")
+    ap.add_argument("--bg-tolerance", type=int, default=18, help="brightness tolerance for background detection (0-255, higher = more aggressive)")
+    ap.add_argument("--bed-width-mm", type=float, default=220.0, help="plotter bed/plate width (mm)")
+    ap.add_argument("--bed-height-mm", type=float, default=220.0, help="plotter bed/plate height (mm)")
+    ap.add_argument("--no-center", action="store_true", help="don't auto-center the drawing on the bed; use --origin-x/--origin-y instead")
+    ap.add_argument("--origin-x", type=float, default=10.0, help="X offset of drawing origin on the bed (mm) -- only used with --no-center")
+    ap.add_argument("--origin-y", type=float, default=10.0, help="Y offset of drawing origin on the bed (mm) -- only used with --no-center")
 
     args = ap.parse_args()
 
@@ -240,14 +309,18 @@ def main():
     )
     hatch_spacing_px = args.hatch_spacing_mm / ((px_to_mm_x + px_to_mm_y) / 2)
 
+    background_mask = None
+    if not args.no_bg_detect:
+        background_mask = detect_background_mask(gray, args.bg_tolerance)
+
     all_paths = []
     if not args.no_outline:
-        outline_paths = generate_outline_paths(gray, args.canny_low, args.canny_high)
+        outline_paths = generate_outline_paths(gray, args.canny_low, args.canny_high, background_mask=background_mask)
         print(f"Outline pass: {len(outline_paths)} paths")
         all_paths.extend(outline_paths)
 
     if args.shading_levels > 0:
-        hatch_paths = generate_hatch_paths(gray, args.shading_levels, hatch_spacing_px)
+        hatch_paths = generate_hatch_paths(gray, args.shading_levels, hatch_spacing_px, background_mask=background_mask)
         print(f"Shading pass: {len(hatch_paths)} paths")
         all_paths.extend(hatch_paths)
 
@@ -258,11 +331,20 @@ def main():
     print("Ordering paths for minimal travel...")
     all_paths = order_paths(all_paths)
 
+    if args.no_center:
+        origin_x, origin_y = args.origin_x, args.origin_y
+    else:
+        origin_x, origin_y = compute_centered_origin(args.bed_width_mm, args.bed_height_mm, w_mm, h_mm)
+        if origin_x < 0 or origin_y < 0:
+            print(f"Warning: drawing ({w_mm:.1f}x{h_mm:.1f}mm) is larger than the bed "
+                  f"({args.bed_width_mm:.1f}x{args.bed_height_mm:.1f}mm); it will run off the plate.",
+                  file=sys.stderr)
+
     gcode = paths_to_gcode(
         all_paths, px_to_mm_x, px_to_mm_y,
         args.pen_up_z, args.pen_down_z,
         args.draw_feed, args.travel_feed,
-        args.origin_x, args.origin_y,
+        origin_x, origin_y,
     )
 
     with open(args.output, "w") as f:
@@ -270,7 +352,7 @@ def main():
 
     total_pts = sum(len(p) for p in all_paths)
     print(f"Wrote {args.output}: {len(all_paths)} paths, {total_pts} points")
-    print(f"Drawing area: {w_mm:.1f}mm x {h_mm:.1f}mm, placed at ({args.origin_x}, {args.origin_y})")
+    print(f"Drawing area: {w_mm:.1f}mm x {h_mm:.1f}mm, placed at ({origin_x:.1f}, {origin_y:.1f})")
 
 
 if __name__ == "__main__":
