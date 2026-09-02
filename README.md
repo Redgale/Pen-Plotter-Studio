@@ -15,6 +15,8 @@ the actual pen strokes, and optional direct serial streaming to the machine.
 - Outline tracing (Canny edge detection) for clean linework.
 - Adjustable multi-level crosshatch shading — darker areas get more
   overlapping hatch directions, mimicking pencil/ink shading.
+- Dot-based **Infill** shading — a dense field of individually placed dots
+  follows image darkness, with blank regions skipped completely.
 - Export standalone `.gcode`, or stream it straight to the machine over
   serial with a progress bar and live log.
 - Runs on Linux (AppImage) and Windows (`.exe`); source is plain
@@ -89,12 +91,13 @@ required input; everything else has a sensible default.
 | Width | 10–500 mm | 150 | Physical width of the output drawing. |
 | Height | 10–500 mm | 150 | Physical height. Disabled while aspect lock is on. |
 | Lock aspect ratio | — | on | When on, Height is computed automatically from the source image's proportions. Turn off to intentionally stretch/squash. |
-| Bed origin X / Y | 0–300 mm | 10 / 10 | Where the drawing's origin lands on the bed — shift it to clear clips, a jig, or a previous drawing. |
+| Bed origin X / Y | 0–300 mm | 0 / 0 | Manual origin when centering is disabled. |
+| Reserved right side | 0–100 mm | 10 | Area at the right side of the 220 mm plate that is never used for drawing. |
 
 ### Pen Z Calibration (Z-axis lift, no servo)
 | Setting | Range | Default | What it does |
 |---|---|---|---|
-| Pen up Z | 0–50 mm | 5 | Height the machine parks at between strokes / while repositioning. Must clear the paper. |
+| Pen up Z | 0–50 mm | 3 | Height the machine parks at between strokes / while repositioning. Must clear the paper. |
 | Pen down Z | -10–50 mm | 0 | Height where the pen tip touches paper with the right pressure. **This is specific to your pen and holder** — don't trust the default. Use the **Pen Up / Pen Down** jog buttons in the Connection panel, on real paper, to find the right value before drawing anything you care about. |
 
 ### Outline Tracing
@@ -111,7 +114,7 @@ each traced line to cut down the point count.
 more noise); raise both to keep only strong, confident edges (cleaner, but
 may drop subtle detail).
 
-### Crosshatch Shading
+### Shading
 Builds shading from layered hatch lines: darker regions of the image get
 more overlapping line directions stacked on top of each other, the way a
 pencil illustrator crosshatches for shadow.
@@ -119,8 +122,11 @@ pencil illustrator crosshatches for shadow.
 | Setting | Range | Default | What it does |
 |---|---|---|---|
 | Enable (checkbox on the group title) | — | on | Turn shading off for outline-only line art. |
-| Hatch levels | 0–6 | 3 | How many overlapping hatch directions get layered. Each extra level adds one more rotated line pass over progressively darker brightness bands — darkest areas get the most overlapping directions (visually darkest), lighter mid-tones get fewer. More levels = smoother tonal range but larger files and longer draw times. `0` = no shading at all. |
-| Base spacing | 0.4–5.0 mm | 1.4 | Gap between parallel lines within one hatch layer. **This is the biggest lever on how dark the shading can get** — smaller spacing = more ink coverage = darker; go below ~0.8mm only if your pen tip is fine enough not to just fill in solid black. |
+| Method | Crosshatch / Infill (dots) | Crosshatch | Crosshatch uses layered lines; Infill uses individual dots whose density follows darkness. |
+| Hatch levels | 0–6 | 3 | Number of overlapping hatch directions for Crosshatch. |
+| Hatch spacing | 0.4–5.0 mm | 1.4 | Gap between Crosshatch lines. |
+| Dot spacing | 0.6–6.0 mm | 1.8 | Candidate spacing for Infill dots. Smaller = more dots and darker/smoother shading. |
+| Dot darkness threshold | 0–0.8 | 0.08 | Darkness below this value produces no dot, preventing ink in near-white areas. |
 
 ### Motion
 | Setting | Range | Default | What it does |

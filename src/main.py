@@ -86,26 +86,21 @@ class PreviewWorker(QThread):
                 self.image_path, p["width_mm"], p["height_mm"]
             )
 
-            background_mask = None
-            if p["bg_detect_enabled"]:
-                background_mask = core.detect_background_mask(gray, p["bg_tolerance"])
-
-            paths = []
-            if p["outline_enabled"]:
-                paths += core.generate_outline_paths(gray, p["canny_low"], p["canny_high"], background_mask=background_mask)
-            if p["shading_enabled"] and p["shading_levels"] > 0:
-                spacing_px = p["hatch_spacing_mm"] / ((px_x + px_y) / 2)
-                paths += core.generate_hatch_paths(gray, p["shading_levels"], spacing_px, background_mask=background_mask)
-
-            if paths:
-                paths = core.order_paths(paths)
+            p = dict(p)
+            p["px_x"], p["px_y"] = px_x, px_y
+            paths = core.build_paths_for_image(gray, p)
 
             # render preview canvas (white bg, black strokes) at gray's resolution
             canvas = np.full((*gray.shape, 3), 255, dtype=np.uint8)
             for path in paths:
-                pts = np.array([(int(x), int(y)) for x, y in path], dtype=np.int32)
-                if len(pts) >= 2:
-                    cv2.polylines(canvas, [pts], False, (108, 92, 231), 1, cv2.LINE_AA)
+                if len(path) == 1:
+                    x, y = int(round(path[0][0])), int(round(path[0][1]))
+                    if 0 <= x < canvas.shape[1] and 0 <= y < canvas.shape[0]:
+                        cv2.circle(canvas, (x, y), 1, (108, 92, 231), -1, cv2.LINE_AA)
+                else:
+                    pts = np.array([(int(x), int(y)) for x, y in path], dtype=np.int32)
+                    if len(pts) >= 2:
+                        cv2.polylines(canvas, [pts], False, (108, 92, 231), 1, cv2.LINE_AA)
 
             total_pts = sum(len(pp) for pp in paths)
             total_len_mm = 0.0
@@ -291,11 +286,13 @@ class MainWindow(QMainWindow):
         sf.addRow(self.lock_aspect)
         self.bed_width = QDoubleSpinBox(); self.bed_width.setRange(10, 1000); self.bed_width.setValue(220); self.bed_width.setSuffix(" mm")
         self.bed_height = QDoubleSpinBox(); self.bed_height.setRange(10, 1000); self.bed_height.setValue(220); self.bed_height.setSuffix(" mm")
+        self.unusable_right = QDoubleSpinBox(); self.unusable_right.setRange(0, 100); self.unusable_right.setValue(10); self.unusable_right.setSuffix(" mm")
         sf.addRow("Plate width", self.bed_width)
         sf.addRow("Plate height", self.bed_height)
+        sf.addRow("Reserved right side", self.unusable_right)
         self.center_on_bed = QCheckBox("Center on plate"); self.center_on_bed.setChecked(True)
         sf.addRow(self.center_on_bed)
-        self.origin_x = QDoubleSpinBox(); self.origin_x.setRange(0, 1000); self.origin_x.setValue(10); self.origin_x.setSuffix(" mm")
+        self.origin_x = QDoubleSpinBox(); self.origin_x.setRange(0, 1000); self.origin_x.setValue(0); self.origin_x.setSuffix(" mm")
         self.origin_y = QDoubleSpinBox(); self.origin_y.setRange(0, 1000); self.origin_y.setValue(10); self.origin_y.setSuffix(" mm")
         sf.addRow("Bed origin X", self.origin_x)
         sf.addRow("Bed origin Y", self.origin_y)
@@ -306,7 +303,7 @@ class MainWindow(QMainWindow):
         # Pen Z group
         pen_group = QGroupBox("Pen Z Calibration  (Z-axis lift, no servo)")
         pf = QFormLayout(pen_group)
-        self.pen_up = QDoubleSpinBox(); self.pen_up.setRange(0, 50); self.pen_up.setValue(5.0); self.pen_up.setSuffix(" mm"); self.pen_up.setSingleStep(0.5)
+        self.pen_up = QDoubleSpinBox(); self.pen_up.setRange(0, 50); self.pen_up.setValue(3.0); self.pen_up.setSuffix(" mm"); self.pen_up.setSingleStep(0.5)
         self.pen_down = QDoubleSpinBox(); self.pen_down.setRange(-10, 50); self.pen_down.setValue(0.0); self.pen_down.setSuffix(" mm"); self.pen_down.setSingleStep(0.1)
         pf.addRow("Pen up Z", self.pen_up)
         pf.addRow("Pen down Z", self.pen_down)
@@ -340,6 +337,9 @@ class MainWindow(QMainWindow):
         self.canny_high = QSpinBox(); self.canny_high.setRange(0, 500); self.canny_high.setValue(150)
         of.addRow("Edge sensitivity (low)", self.canny_low)
         of.addRow("Edge sensitivity (high)", self.canny_high)
+        edge_hint = QLabel("The image is contrast-normalized first; extreme settings are kept usable instead of turning every pixel into an edge.")
+        edge_hint.setWordWrap(True); edge_hint.setStyleSheet("color:#8b8fa3; font-size:11px;")
+        of.addRow(edge_hint)
         sv.addWidget(outline_group)
 
         # Shading group
@@ -348,10 +348,19 @@ class MainWindow(QMainWindow):
         shade_group.setChecked(True)
         self.shade_group = shade_group
         shf = QFormLayout(shade_group)
+        self.shading_method = QComboBox(); self.shading_method.addItems(["Crosshatch", "Infill (dots)"])
+        self.dot_spacing = QDoubleSpinBox(); self.dot_spacing.setRange(0.6, 6.0); self.dot_spacing.setValue(1.8); self.dot_spacing.setSingleStep(0.1); self.dot_spacing.setSuffix(" mm")
+        self.dot_threshold = QDoubleSpinBox(); self.dot_threshold.setRange(0.0, 0.8); self.dot_threshold.setValue(0.08); self.dot_threshold.setSingleStep(0.01)
         self.shading_levels = QSpinBox(); self.shading_levels.setRange(0, 6); self.shading_levels.setValue(3)
         self.hatch_spacing = QDoubleSpinBox(); self.hatch_spacing.setRange(0.4, 5.0); self.hatch_spacing.setValue(1.4); self.hatch_spacing.setSingleStep(0.1); self.hatch_spacing.setSuffix(" mm")
+        shf.addRow("Method", self.shading_method)
         shf.addRow("Hatch levels", self.shading_levels)
-        shf.addRow("Base spacing", self.hatch_spacing)
+        shf.addRow("Hatch spacing", self.hatch_spacing)
+        shf.addRow("Dot spacing", self.dot_spacing)
+        shf.addRow("Dot darkness threshold", self.dot_threshold)
+        shade_hint = QLabel("Infill uses individual pen dots with density proportional to darkness; blank areas are skipped entirely.")
+        shade_hint.setWordWrap(True); shade_hint.setStyleSheet("color:#8b8fa3; font-size:11px;")
+        shf.addRow(shade_hint)
         sv.addWidget(shade_group)
 
         # Motion group
@@ -470,11 +479,12 @@ class MainWindow(QMainWindow):
 
         # Debounced auto-preview on parameter changes
         for w in [self.width_spin, self.height_spin, self.canny_low, self.canny_high,
-                  self.shading_levels, self.hatch_spacing, self.bg_tolerance]:
+                  self.shading_levels, self.hatch_spacing, self.dot_spacing, self.dot_threshold, self.bg_tolerance]:
             if isinstance(w, (QDoubleSpinBox, QSpinBox)):
                 w.valueChanged.connect(self._schedule_preview)
         self.outline_group.toggled.connect(self._schedule_preview)
         self.shade_group.toggled.connect(self._schedule_preview)
+        self.shading_method.currentIndexChanged.connect(self._schedule_preview)
         self.bg_group.toggled.connect(self._schedule_preview)
 
     def _schedule_preview(self, *_):
@@ -515,12 +525,17 @@ class MainWindow(QMainWindow):
             canny_high=self.canny_high.value(),
             shading_levels=self.shading_levels.value(),
             hatch_spacing_mm=self.hatch_spacing.value(),
+            shading_spacing_mm=self.dot_spacing.value() if self.shading_method.currentIndex() == 1 else self.hatch_spacing.value(),
+            shading_method="infill" if self.shading_method.currentIndex() == 1 else "crosshatch",
+            dot_threshold=self.dot_threshold.value(),
+            front_view_correction=True,
             pen_up_z=self.pen_up.value(),
             pen_down_z=self.pen_down.value(),
             draw_feed=self.draw_feed.value(),
             travel_feed=self.travel_feed.value(),
             bed_width_mm=self.bed_width.value(),
             bed_height_mm=self.bed_height.value(),
+            unusable_right_mm=self.unusable_right.value(),
             center_on_bed=self.center_on_bed.isChecked(),
             origin_x=self.origin_x.value(),
             origin_y=self.origin_y.value(),
@@ -581,14 +596,16 @@ class MainWindow(QMainWindow):
     def _resolve_origin(self, p, stats):
         if p["center_on_bed"]:
             origin_x, origin_y = core.compute_centered_origin(
-                p["bed_width_mm"], p["bed_height_mm"], stats["width_mm"], stats["height_mm"]
+                p["bed_width_mm"], p["bed_height_mm"], stats["width_mm"], stats["height_mm"],
+                p["unusable_right_mm"]
             )
-            if origin_x < 0 or origin_y < 0:
-                self.statusBar().showMessage(
-                    "Warning: drawing is larger than the plate -- it will run off the edge.", 6000
-                )
             return origin_x, origin_y
-        return p["origin_x"], p["origin_y"]
+        origin_x, origin_y = p["origin_x"], p["origin_y"]
+        core.validate_drawing_placement(
+            origin_x, origin_y, stats["width_mm"], stats["height_mm"],
+            p["bed_width_mm"], p["bed_height_mm"], p["unusable_right_mm"]
+        )
+        return origin_x, origin_y
 
     def _build_gcode(self):
         p = self._collect_params()
