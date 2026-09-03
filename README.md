@@ -28,11 +28,18 @@ the actual pen strokes, and optional direct serial streaming to the machine.
   comes off the bed the same way up as the preview, plus per-side
   unusable-margin fields and paper-size presets that keep every move
   inside the reachable area.
-- Emits `M107` so the head fan stays off, tracks pen state so no pen-down
-  move is wasted, and drops hatch fragments too short to be worth a
-  pen lift.
-- Export standalone `.gcode`, or stream it straight to the machine over
-  serial with a progress bar and live log.
+- **Clip Avoidance** — a separately toggled per-edge keep-out (Top /
+  Bottom / Left / Right, as you face the machine) that pulls the drawable
+  area in so the pen never hits the clips holding the paper down.
+- Emits `M107` so the part-cooling fan stays off, tracks pen state so no
+  pen-down move is wasted, and drops hatch fragments too short to be
+  worth a pen lift.
+- Export standalone `.gcode` (with a `; PPS-SETTINGS:` header), or stream
+  it straight to the machine over serial with a progress bar and live log.
+- **Import G-code** — load a `.gcode` file back in to restore the settings
+  that made it and preview the exact toolpath the printer would run from
+  it (files this app or its CLI wrote round-trip fully; hand-written files
+  recover pen Z, feeds, fan and homing from the moves themselves).
 - Runs on Linux (AppImage) and Windows (`.exe`); source is plain
   cross-platform Python/Qt, so macOS works too if you build it yourself.
 
@@ -128,8 +135,25 @@ PNG cut-out is used directly as the subject mask.
 | Setting | Range | Default | What it does |
 |---|---|---|---|
 | Bed width / height | 10–1000 mm | 220 / 220 | Physical bed travel. |
-| Unusable left / right / front / back | 0–200 mm | 0 / 10 / 0 / 0 | Strips the head can't reach or shouldn't enter. Default clears the 10 mm dead column past X = 210 on a typical Ender 3 V2. The drawing is centered in whatever rectangle is left. |
+| Unusable left / right / front / back | 0–200 mm | 0 / 20 / 0 / 0 | Strips the head can't reach or shouldn't enter. Default clears the 20 mm dead column past X = 200 on a typical Ender 3 V2. The drawing is centered in whatever rectangle is left. |
 | Center in reachable area | — | on | Off = place the drawing at an explicit Origin X / Y (still clamped inside the reachable rectangle). |
+
+### Clip Avoidance
+A second keep-out layer, toggled on/off as a group and **on by default**.
+It stacks on top of the unusable margins above and pulls the drawable area
+in from each edge so the pen misses the clips holding the paper down. All
+four values are independent. Directions are as you face the machine from
+the front.
+
+| Setting | Range | Default | What it does |
+|---|---|---|---|
+| Clip Avoidance - Top | 0–200 mm | 10 | Moves the drawable area in from the **back** of the bed (Y+). |
+| Clip Avoidance - Bottom | 0–200 mm | 10 | Moves it in from the **front** of the bed (Y-). |
+| Clip Avoidance - Left | 0–200 mm | 5 | Moves it in from the left edge (X-). |
+| Clip Avoidance - Right | 0–200 mm | 5 | Moves it in from the right edge (X+). |
+
+CLI equivalents: `--clip-top-mm`, `--clip-bottom-mm`, `--clip-left-mm`,
+`--clip-right-mm`, and `--no-clip-avoidance` to switch the whole layer off.
 
 ### Orientation
 | Setting | Default | What it does |
@@ -140,7 +164,7 @@ PNG cut-out is used directly as the subject mask.
 ### Pen Z Calibration (Z-axis lift, no servo)
 | Setting | Range | Default | What it does |
 |---|---|---|---|
-| Pen up Z (hop) | 0–50 mm | **3** | Height the pen lifts to between strokes / dots. Must clear the paper; 3 mm is plenty for flat paper and keeps dot mode fast. |
+| Pen up Z (hop) | 0–50 mm | **2** | Height the pen lifts to between strokes / dots. Must clear the paper; 2 mm is plenty for flat paper and keeps dot mode fast. |
 | Pen down Z | -10–50 mm | 0 | Height where the pen tip touches paper with the right pressure. **Specific to your pen and holder** — use the **Pen Up / Pen Down** jog buttons on real paper to find it. |
 
 ### Tone / Image Recognition
@@ -200,24 +224,33 @@ the grid so they don't line up. Best with a ballpoint or fine liner.
 | Dot dwell | 0–500 ms | 0 | Pause with the pen down at each dot. A ballpoint usually marks instantly (leave at 0); bump to ~15–30 ms if a stiff pen skips. Adds up over thousands of dots. |
 
 > Stipple mode is a lot of individual pen-up/down cycles. Expect large
-> files and long runs; keep Pen up Z low (the default 3 mm) and the dot
+> files and long runs; keep Pen up Z low (the default 2 mm) and the dot
 > pitch no smaller than you need.
 
 ### Motion & Output
 | Setting | Range | Default | What it does |
 |---|---|---|---|
-| Draw feed | 100–8000 mm/min | 1500 | Speed with the pen down. |
-| Travel feed | 100–12000 mm/min | 3000 | Speed for pen-up moves and Z hops. |
-| Head fan off (M107) | — | on | Emits `M107` at the start so the part-cooling fan on the (unused) hot-end stays off. |
+| Draw feed | 100–8000 mm/min | 3000 | Speed with the pen down. |
+| Travel feed | 100–12000 mm/min | 6000 | Speed for pen-up moves and Z hops. |
+| Head fan off (M107) | — | on | Emits `M107` at the start so the part-cooling fan on the (unused) hot-end stays off. This is only the part-cooling fan — the hot-end **heatsink fan** on an Ender 3 V2 is wired to always run whenever the printer is powered and can't be switched off from G-code. |
 | Home X/Y at start (G28 X Y) | — | on | Homes X and Y before drawing. Turn off if you home manually / from a jig. |
 
 ### Preview / Export
 - **Update Preview** — forces an immediate regeneration (auto-updates
-  ~450 ms after any change anyway).
+  ~450 ms after any change anyway). Preview strokes and dots are drawn in
+  black.
 - The stats line shows path/point/dot counts, line length, drawing size
   and origin, and a draw-time estimate that now **includes** pen-up travel,
   Z hops and dot dwell (still ignores acceleration, so treat it as a floor).
-- **Export G-code…** — saves the currently previewed paths.
+- **Export G-code…** — saves the currently previewed paths, with a
+  `; PPS-SETTINGS: {…}` header recording every sidebar value.
+- **Import G-code…** — load a `.gcode` file back in. Its `; PPS-SETTINGS:`
+  header (present on anything this app or its CLI exported) restores the
+  whole sidebar; failing that, pen up/down Z, draw/travel feeds, `M106`/
+  `M107` fan state and `G28` homing are inferred from the moves. The canvas
+  then shows the **actual toolpath from that file** on a bed grid — not a
+  re-run of the conversion — so you see exactly what the printer would
+  draw. The imported file can be sent to the machine as-is.
 
 ### Send to Machine
 | Control | What it does |
@@ -251,12 +284,21 @@ the grid so they don't line up. Best with a ballpoint or fine liner.
    is tens of thousands of paths).
 6. **Fit & place** (`fit_drawing`, `place_in_usable`) — scale to fit
    paper ∩ reachable bed, centre in the reachable rectangle.
+6b. **Clip Avoidance** (`apply_clip_avoidance`) — shrinks the usable
+   rectangle from step 6 further on each edge (back/front/left/right) so
+   the pen clears the paper clips; used by both `usable_rect` in the GUI
+   and the CLI.
 7. **G-code export** (`paths_to_gcode`) — `G21/G90`, optional `M107` and
    `G28 X Y`, straight `G1` moves only (no `G0`, no `M280`, no heater
    commands). Optional Y flip / X mirror in the pixel→bed mapping, pen
    state tracked so no Z move or travel is redundant, single-point paths
    become dot taps (with optional `G4` dwell). `_clean_paths` drops
-   sub-0.6 mm fragments and duplicate points first.
+   sub-0.6 mm fragments and duplicate points first. `settings_comment`
+   writes the `; PPS-SETTINGS:` header.
+8. **G-code import** (`parse_gcode`, `render_gcode_bed_preview`) — replays
+   the moves in a file to a list of bed-mm polylines plus the recovered
+   settings dict, then rasterises that toolpath onto a bed grid. Does not
+   touch the image pipeline.
 
 `cli/image_to_gcode.py` adds `src/` to `sys.path` and imports
 `gcode_core` — the exact module the GUI (`src/main.py`) uses — so CLI and

@@ -48,22 +48,34 @@ def main():
     ap.add_argument("--bed-width-mm", type=float, default=220.0)
     ap.add_argument("--bed-height-mm", type=float, default=220.0)
     ap.add_argument("--margin-left-mm", type=float, default=0.0)
-    ap.add_argument("--margin-right-mm", type=float, default=10.0,
+    ap.add_argument("--margin-right-mm", type=float, default=20.0,
                     help="unusable strip on the printer's high-X edge")
     ap.add_argument("--margin-front-mm", type=float, default=0.0)
     ap.add_argument("--margin-back-mm", type=float, default=0.0)
+
+    # clip avoidance -- extra keep-out on every edge so the pen misses the
+    # clips holding the paper down (directions as you face the machine)
+    ap.add_argument("--no-clip-avoidance", dest="clip_avoidance",
+                    action="store_false", default=True,
+                    help="disable the Clip Avoidance keep-out (on by default)")
+    ap.add_argument("--clip-top-mm", type=float, default=10.0,
+                    help="pull the drawable area in from the BACK of the bed")
+    ap.add_argument("--clip-bottom-mm", type=float, default=10.0,
+                    help="pull the drawable area in from the FRONT of the bed")
+    ap.add_argument("--clip-left-mm", type=float, default=5.0)
+    ap.add_argument("--clip-right-mm", type=float, default=5.0)
     ap.add_argument("--no-center", action="store_true")
     ap.add_argument("--origin-x", type=float, default=None)
     ap.add_argument("--origin-y", type=float, default=None)
 
     # pen Z
-    ap.add_argument("--pen-up-z", type=float, default=3.0,
-                    help="Z with the pen lifted (mm) -- default 3")
+    ap.add_argument("--pen-up-z", type=float, default=2.0,
+                    help="Z with the pen lifted / Z hop (mm) -- default 2")
     ap.add_argument("--pen-down-z", type=float, default=0.0)
 
     # motion
-    ap.add_argument("--draw-feed", type=int, default=1500)
-    ap.add_argument("--travel-feed", type=int, default=3000)
+    ap.add_argument("--draw-feed", type=int, default=3000)
+    ap.add_argument("--travel-feed", type=int, default=6000)
 
     # orientation / machine
     ap.add_argument("--no-flip-y", action="store_true",
@@ -116,6 +128,11 @@ def main():
     usable_h = args.bed_height_mm - args.margin_front_mm - args.margin_back_mm
     usable_x0 = args.margin_left_mm
     usable_y0 = args.margin_front_mm
+    if args.clip_avoidance:
+        usable_x0, usable_y0, usable_w, usable_h = core.apply_clip_avoidance(
+            usable_x0, usable_y0, usable_w, usable_h,
+            clip_left=args.clip_left_mm, clip_right=args.clip_right_mm,
+            clip_front=args.clip_bottom_mm, clip_back=args.clip_top_mm)
 
     fit_w, fit_h = core.fit_drawing(
         gray.shape[1], gray.shape[0], args.width_mm, args.height_mm,
@@ -147,13 +164,44 @@ def main():
         fit_w, fit_h, usable_x0, usable_y0, usable_w, usable_h,
         center=not args.no_center, origin_x=args.origin_x, origin_y=args.origin_y)
 
+    settings_comment = dict(
+        width_mm=args.width_mm,
+        height_mm=args.height_mm if args.height_mm else args.width_mm,
+        lock_aspect=args.height_mm is None,
+        paper_margin_mm=args.paper_margin_mm,
+        bed_width_mm=args.bed_width_mm, bed_height_mm=args.bed_height_mm,
+        margin_left=args.margin_left_mm, margin_right=args.margin_right_mm,
+        margin_front=args.margin_front_mm, margin_back=args.margin_back_mm,
+        clip_avoidance_enabled=args.clip_avoidance,
+        clip_top=args.clip_top_mm, clip_bottom=args.clip_bottom_mm,
+        clip_left=args.clip_left_mm, clip_right=args.clip_right_mm,
+        center_on_bed=not args.no_center,
+        origin_x=args.origin_x or 0.0, origin_y=args.origin_y or 0.0,
+        flip_y=not args.no_flip_y, mirror_x=args.mirror_x,
+        fan_off=not args.fan_on, home_xy=not args.no_home,
+        brightness=args.brightness, contrast=args.contrast, gamma=args.gamma,
+        dark_boost=args.dark_boost,
+        normalize=not args.no_normalize, clahe=not args.no_clahe,
+        denoise=not args.no_denoise,
+        bg_detect_enabled=not args.no_bg_detect, bg_tolerance=args.bg_tolerance,
+        outline_enabled=not args.no_outline,
+        canny_low=args.canny_low, canny_high=args.canny_high,
+        shading_enabled=args.shading != "none", shading_style=args.shading,
+        shading_levels=args.shading_levels,
+        hatch_spacing_mm=args.hatch_spacing_mm,
+        dot_spacing_mm=args.dot_spacing_mm, dot_gamma=args.dot_gamma,
+        dot_dwell_ms=args.dot_dwell_ms,
+        pen_up_z=args.pen_up_z, pen_down_z=args.pen_down_z,
+        draw_feed=args.draw_feed, travel_feed=args.travel_feed,
+    )
+
     gcode = core.paths_to_gcode(
         paths, px_x, px_y, args.pen_up_z, args.pen_down_z,
         args.draw_feed, args.travel_feed, ox, oy,
         content_w_px=gray.shape[1], content_h_px=gray.shape[0],
         flip_y=not args.no_flip_y, mirror_x=args.mirror_x,
         fan_off=not args.fan_on, dot_dwell_ms=args.dot_dwell_ms,
-        home_xy=not args.no_home,
+        home_xy=not args.no_home, settings_comment=settings_comment,
     )
 
     with open(args.output, "w") as f:

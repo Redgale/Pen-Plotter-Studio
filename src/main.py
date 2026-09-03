@@ -91,12 +91,22 @@ def cv_to_qpixmap(gray_or_bgr):
 
 
 def usable_rect(p):
-    """Return (x0, y0, w, h) of the reachable bed area after margins."""
+    """Return (x0, y0, w, h) of the reachable bed area after the unusable
+    margins and, if enabled, the extra Clip Avoidance keep-out on every
+    edge."""
     x0 = p["margin_left"]
     y0 = p["margin_front"]
     w = p["bed_width_mm"] - p["margin_left"] - p["margin_right"]
     h = p["bed_height_mm"] - p["margin_front"] - p["margin_back"]
-    return x0, y0, max(w, 1.0), max(h, 1.0)
+    x0, y0, w, h = x0, y0, max(w, 1.0), max(h, 1.0)
+    if p.get("clip_avoidance_enabled"):
+        x0, y0, w, h = core.apply_clip_avoidance(
+            x0, y0, w, h,
+            clip_left=p.get("clip_left", 0.0),
+            clip_right=p.get("clip_right", 0.0),
+            clip_front=p.get("clip_bottom", 0.0),
+            clip_back=p.get("clip_top", 0.0))
+    return x0, y0, w, h
 
 
 def resolve_size_and_origin(p, img_w_px, img_h_px):
@@ -165,7 +175,7 @@ class PreviewWorker(QThread):
             # preview canvas: white bg, subject only, drawn the same way up
             # as the source image (which is the way it will print)
             canvas = np.full((ih, iw, 3), 255, dtype=np.uint8)
-            stroke = (108, 92, 231)
+            stroke = (0, 0, 0)
             for path in paths:
                 if len(path) == 1:
                     x, y = path[0]
@@ -285,6 +295,7 @@ class MainWindow(QMainWindow):
         self.current_canvas = None
         self.current_stats = None
         self.gcode_text = None
+        self.imported_gcode_text = None
         self.preview_worker = None
         self.send_worker = None
         self._preview_busy = False
@@ -391,7 +402,7 @@ class MainWindow(QMainWindow):
         self.bed_width = spin(QDoubleSpinBox, 10, 1000, 220, 1, " mm")
         self.bed_height = spin(QDoubleSpinBox, 10, 1000, 220, 1, " mm")
         self.margin_left = spin(QDoubleSpinBox, 0, 200, 0, 1, " mm")
-        self.margin_right = spin(QDoubleSpinBox, 0, 200, 10, 1, " mm")
+        self.margin_right = spin(QDoubleSpinBox, 0, 200, 20, 1, " mm")
         self.margin_front = spin(QDoubleSpinBox, 0, 200, 0, 1, " mm")
         self.margin_back = spin(QDoubleSpinBox, 0, 200, 0, 1, " mm")
         bg.addRow("Bed width (X)", self.bed_width)
@@ -407,6 +418,31 @@ class MainWindow(QMainWindow):
         bg.addRow("Origin X", self.origin_x)
         bg.addRow("Origin Y", self.origin_y)
         sv.addWidget(bed_group)
+
+        # ---- Clip Avoidance ----
+        clip_group = QGroupBox("Clip Avoidance")
+        clip_group.setCheckable(True)
+        clip_group.setChecked(True)
+        self.clip_group = clip_group
+        clf = QFormLayout(clip_group)
+        self.clip_top = spin(QDoubleSpinBox, 0, 200, 10, 1, " mm")
+        self.clip_bottom = spin(QDoubleSpinBox, 0, 200, 10, 1, " mm")
+        self.clip_left = spin(QDoubleSpinBox, 0, 200, 5, 1, " mm")
+        self.clip_right = spin(QDoubleSpinBox, 0, 200, 5, 1, " mm")
+        clf.addRow("Clip Avoidance - Top", self.clip_top)
+        clf.addRow("Clip Avoidance - Bottom", self.clip_bottom)
+        clf.addRow("Clip Avoidance - Left", self.clip_left)
+        clf.addRow("Clip Avoidance - Right", self.clip_right)
+        clh = QLabel("Pulls the drawable area in from each edge so the pen "
+                     "never runs into a clip holding the paper down. "
+                     "Directions are as you face the machine from the front: "
+                     "Top = back of the bed (Y+), Bottom = front (Y-), "
+                     "Left / Right as seen from the front. Adds on top of the "
+                     "unusable margins above.")
+        clh.setWordWrap(True)
+        clh.setStyleSheet("color:#8b8fa3; font-size:11px;")
+        clf.addRow(clh)
+        sv.addWidget(clip_group)
 
         # ---- Orientation ----
         ori_group = QGroupBox("Orientation")
@@ -425,7 +461,7 @@ class MainWindow(QMainWindow):
         # ---- Pen Z ----
         pen_group = QGroupBox("Pen Z Calibration  (Z-axis lift, no servo)")
         pf = QFormLayout(pen_group)
-        self.pen_up = spin(QDoubleSpinBox, 0, 50, 3.0, 0.5, " mm")
+        self.pen_up = spin(QDoubleSpinBox, 0, 50, 2.0, 0.5, " mm")
         self.pen_down = spin(QDoubleSpinBox, -10, 50, 0.0, 0.1, " mm")
         pf.addRow("Pen up Z (hop)", self.pen_up)
         pf.addRow("Pen down Z", self.pen_down)
@@ -503,8 +539,8 @@ class MainWindow(QMainWindow):
         # ---- Motion / Output ----
         motion_group = QGroupBox("Motion & Output")
         mf = QFormLayout(motion_group)
-        self.draw_feed = spin(QSpinBox, 100, 8000, 1500, 100, " mm/min")
-        self.travel_feed = spin(QSpinBox, 100, 12000, 3000, 100, " mm/min")
+        self.draw_feed = spin(QSpinBox, 100, 8000, 3000, 100, " mm/min")
+        self.travel_feed = spin(QSpinBox, 100, 12000, 6000, 100, " mm/min")
         mf.addRow("Draw feed", self.draw_feed)
         mf.addRow("Travel feed", self.travel_feed)
         self.fan_off = QCheckBox("Head fan off (M107)"); self.fan_off.setChecked(True)
@@ -519,8 +555,10 @@ class MainWindow(QMainWindow):
         self.export_btn = QPushButton("Export G-code…")
         self.export_btn.setObjectName("accentButton")
         self.export_btn.setEnabled(False)
+        self.import_btn = QPushButton("Import G-code…")
         sv.addWidget(self.preview_btn)
         sv.addWidget(self.export_btn)
+        sv.addWidget(self.import_btn)
 
         # ---- Connection ----
         conn_group = QGroupBox("Send to Machine")
@@ -587,6 +625,7 @@ class MainWindow(QMainWindow):
         self.load_btn.clicked.connect(self.on_load_image)
         self.preview_btn.clicked.connect(self.update_preview)
         self.export_btn.clicked.connect(self.on_export_gcode)
+        self.import_btn.clicked.connect(self.on_import_gcode)
         self.refresh_ports_btn.clicked.connect(self.refresh_ports)
         self.send_btn.clicked.connect(self.on_send_gcode)
         self.pause_btn.clicked.connect(self.on_pause_toggle)
@@ -604,12 +643,15 @@ class MainWindow(QMainWindow):
         for w in [self.width_spin, self.height_spin, self.paper_margin,
                   self.bed_width, self.bed_height, self.margin_left,
                   self.margin_right, self.margin_front, self.margin_back,
+                  self.clip_top, self.clip_bottom, self.clip_left,
+                  self.clip_right,
                   self.origin_x, self.origin_y, self.canny_low, self.canny_high,
                   self.shading_levels, self.hatch_spacing, self.dot_spacing,
                   self.dot_gamma, self.bg_tolerance, self.brightness,
                   self.contrast, self.gamma, self.dark_boost]:
             w.valueChanged.connect(self._schedule_preview)
         for c in [self.outline_group, self.shade_group, self.bg_group,
+                  self.clip_group,
                   self.lock_aspect, self.center_on_bed, self.flip_y,
                   self.mirror_x, self.opt_normalize, self.opt_clahe,
                   self.opt_denoise]:
@@ -680,6 +722,11 @@ class MainWindow(QMainWindow):
             margin_right=self.margin_right.value(),
             margin_front=self.margin_front.value(),
             margin_back=self.margin_back.value(),
+            clip_avoidance_enabled=self.clip_group.isChecked(),
+            clip_top=self.clip_top.value(),
+            clip_bottom=self.clip_bottom.value(),
+            clip_left=self.clip_left.value(),
+            clip_right=self.clip_right.value(),
             center_on_bed=self.center_on_bed.isChecked(),
             origin_x=self.origin_x.value(),
             origin_y=self.origin_y.value(),
@@ -752,6 +799,9 @@ class MainWindow(QMainWindow):
         self.current_paths = paths
         self.current_canvas = canvas
         self.current_stats = stats
+        # a fresh image preview supersedes any previously imported G-code
+        self.imported_gcode_text = None
+        self.gcode_text = None
         pix = cv_to_qpixmap(canvas)
         scaled = pix.scaled(self.canvas_label.size(), Qt.KeepAspectRatio,
                             Qt.SmoothTransformation)
@@ -789,6 +839,7 @@ class MainWindow(QMainWindow):
     def _build_gcode(self):
         p = self._collect_params()
         s = self.current_stats
+        settings_comment = {k: v for k, v in p.items() if not k.startswith("_")}
         gcode = core.paths_to_gcode(
             self.current_paths, s["px_x"], s["px_y"],
             p["pen_up_z"], p["pen_down_z"], p["draw_feed"], p["travel_feed"],
@@ -796,6 +847,7 @@ class MainWindow(QMainWindow):
             content_w_px=s["img_w"], content_h_px=s["img_h"],
             flip_y=p["flip_y"], mirror_x=p["mirror_x"], fan_off=p["fan_off"],
             dot_dwell_ms=p["dot_dwell_ms"], home_xy=p["home_xy"],
+            settings_comment=settings_comment,
         )
         return gcode
 
@@ -812,6 +864,115 @@ class MainWindow(QMainWindow):
         self.gcode_text = gcode
         self.send_btn.setEnabled(True)
         self.statusBar().showMessage(f"Saved {path}", 4000)
+
+    def on_import_gcode(self):
+        """Load a .gcode file, restore the settings that produced it, and
+        preview the exact toolpath the printer would run from it."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import G-code", "",
+            "G-code (*.gcode *.gco *.g *.nc *.txt);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+            paths, settings = core.parse_gcode(text)
+        except Exception as e:
+            log_error("on_import_gcode", traceback.format_exc())
+            QMessageBox.warning(self, "Can't read that G-code", str(e))
+            return
+        if not paths:
+            QMessageBox.warning(
+                self, "Nothing to preview",
+                "No pen-down moves were found in that file.")
+            return
+
+        applied = self._apply_imported_settings(settings)
+
+        bed_w = self.bed_width.value()
+        bed_h = self.bed_height.value()
+        canvas = core.render_gcode_bed_preview(paths, bed_w, bed_h)
+        self.current_paths = None          # not image-space paths
+        self.current_canvas = canvas
+        self.current_stats = None
+        self.gcode_text = text
+        self.imported_gcode_text = text
+
+        pix = cv_to_qpixmap(canvas)
+        scaled = pix.scaled(self.canvas_label.size(), Qt.KeepAspectRatio,
+                            Qt.SmoothTransformation)
+        self.canvas_label.setPixmap(scaled)
+        self.canvas_label.setText("")
+
+        n_dots = sum(1 for pp in paths if len(pp) == 1)
+        n_strokes = len(paths) - n_dots
+        self.stats_label.setText(
+            f"Imported {os.path.basename(path)} · {n_strokes} strokes · "
+            f"{n_dots} dots · {applied} settings restored · "
+            f"showing the actual toolpath from this file")
+        self.export_btn.setEnabled(False)  # re-exporting would just copy it
+        self.send_btn.setEnabled(True)
+        self.statusBar().showMessage("G-code imported", 4000)
+
+    def _apply_imported_settings(self, s):
+        """Push recovered values into the sidebar without triggering a
+        preview rebuild per field. Returns how many controls were set."""
+        value_map = {
+            "width_mm": self.width_spin, "height_mm": self.height_spin,
+            "paper_margin_mm": self.paper_margin,
+            "bed_width_mm": self.bed_width, "bed_height_mm": self.bed_height,
+            "margin_left": self.margin_left, "margin_right": self.margin_right,
+            "margin_front": self.margin_front, "margin_back": self.margin_back,
+            "clip_top": self.clip_top, "clip_bottom": self.clip_bottom,
+            "clip_left": self.clip_left, "clip_right": self.clip_right,
+            "origin_x": self.origin_x, "origin_y": self.origin_y,
+            "brightness": self.brightness, "contrast": self.contrast,
+            "gamma": self.gamma, "dark_boost": self.dark_boost,
+            "bg_tolerance": self.bg_tolerance,
+            "canny_low": self.canny_low, "canny_high": self.canny_high,
+            "shading_levels": self.shading_levels,
+            "hatch_spacing_mm": self.hatch_spacing,
+            "dot_spacing_mm": self.dot_spacing, "dot_gamma": self.dot_gamma,
+            "dot_dwell_ms": self.dot_dwell,
+            "pen_up_z": self.pen_up, "pen_down_z": self.pen_down,
+            "draw_feed": self.draw_feed, "travel_feed": self.travel_feed,
+        }
+        check_map = {
+            "lock_aspect": self.lock_aspect,
+            "center_on_bed": self.center_on_bed,
+            "flip_y": self.flip_y, "mirror_x": self.mirror_x,
+            "fan_off": self.fan_off, "home_xy": self.home_xy,
+            "normalize": self.opt_normalize, "clahe": self.opt_clahe,
+            "denoise": self.opt_denoise,
+            "clip_avoidance_enabled": self.clip_group,
+            "bg_detect_enabled": self.bg_group,
+            "outline_enabled": self.outline_group,
+            "shading_enabled": self.shade_group,
+        }
+        widgets = list(value_map.values()) + list(check_map.values()) + [
+            self.shading_style]
+        for w in widgets:
+            w.blockSignals(True)
+        applied = 0
+        try:
+            for key, w in value_map.items():
+                if key in s and isinstance(s[key], (int, float)) \
+                        and not isinstance(s[key], bool):
+                    w.setValue(s[key])
+                    applied += 1
+            for key, w in check_map.items():
+                if key in s:
+                    w.setChecked(bool(s[key]))
+                    applied += 1
+            if s.get("shading_style") in ("stipple", "crosshatch"):
+                self.shading_style.setCurrentIndex(
+                    1 if s["shading_style"] == "stipple" else 0)
+                applied += 1
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+        self._sync_shading_style()
+        return applied
 
     # ---- Serial ----
 
