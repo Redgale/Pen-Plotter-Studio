@@ -78,9 +78,9 @@ def render(path, out, bed=(220, 220), px_per_mm=4):
 
     for s in segs:
         pts = np.array([to_px(p) for p in s], np.int32)
-        cv2.polylines(img, [pts], False, (20, 20, 20), 1, cv2.LINE_AA)
+        cv2.polylines(img, [pts], False, (0, 0, 0), 1, cv2.LINE_AA)
     for d in dots:
-        cv2.circle(img, to_px(d), 1, (20, 20, 20), -1, cv2.LINE_AA)
+        cv2.circle(img, to_px(d), 1, (0, 0, 0), -1, cv2.LINE_AA)
 
     cv2.imwrite(out, img)
     print(f"{out}: {len(segs)} strokes, {len(dots)} dots")
