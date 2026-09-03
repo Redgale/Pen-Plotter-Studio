@@ -1,10 +1,57 @@
 name: Build and Release
+
+# Every push to main (and manual runs) cuts a release whose version is the
+# previous release's version + 0.1 -- V1.5, V1.6, ... V1.9, V2.0.
+# With no V<major>.<minor> tag yet, the first run is V1.4.
+# Put "[skip ci]" in a commit message to push without cutting a release.
 on:
   push:
-    branches:
-      - main
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calc.outputs.version }}
+      tag: ${{ steps.calc.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Work out the next version
+        id: calc
+        run: |
+          latest=$(git tag --list \
+            | grep -iE '^v[0-9]+\.[0-9]+$' \
+            | sed 's/^[Vv]//' \
+            | sort -t. -k1,1n -k2,2n \
+            | tail -n1 || true)
+          if [ -z "$latest" ]; then
+            next="1.4"
+          else
+            next=$(awk "BEGIN { printf \"%.1f\", $latest + 0.1 }")
+          fi
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+          echo "tag=V$next"     >> "$GITHUB_OUTPUT"
+          echo "Previous: ${latest:-none}  ->  Next: V$next"
+      - name: Fail if that tag already exists
+        run: |
+          if git rev-parse -q --verify "refs/tags/${{ steps.calc.outputs.tag }}" >/dev/null; then
+            echo "::error::Tag ${{ steps.calc.outputs.tag }} already exists."
+            exit 1
+          fi
+
   build-linux:
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,11 +64,17 @@ jobs:
           sudo apt-get install -y libfuse2 libegl1 libxkbcommon0
       - name: Build AppImage
         run: bash packaging/linux/build_appimage.sh
+      - name: Name it after the version
+        run: |
+          mv packaging/linux/PenPlotterStudio-x86_64.AppImage \
+             "packaging/linux/PenPlotterStudio-${{ needs.version.outputs.tag }}-x86_64.AppImage"
       - uses: actions/upload-artifact@v4
         with:
           name: linux-appimage
-          path: packaging/linux/PenPlotterStudio-x86_64.AppImage
+          path: packaging/linux/PenPlotterStudio-${{ needs.version.outputs.tag }}-x86_64.AppImage
+
   build-windows:
+    needs: version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,12 +85,14 @@ jobs:
         run: python -m pip install -r packaging\windows\requirements.txt
         shell: cmd
       - name: Build exe
+        env:
+          APP_TAG: ${{ needs.version.outputs.tag }}
         run: |
           python -m PyInstaller --noconfirm --onefile --windowed ^
               --distpath packaging\windows\dist ^
               --workpath packaging\windows\build ^
               --specpath packaging\windows ^
-              --name PenPlotterStudio-x86_64 ^
+              --name PenPlotterStudio-%APP_TAG%-x86_64 ^
               --icon "%CD%\resources\icon.ico" ^
               --add-data "%CD%\resources;resources" ^
               "%CD%\src\main.py"
@@ -45,21 +100,21 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows-exe
-          path: packaging/windows/dist/PenPlotterStudio-x86_64.exe
+          path: packaging/windows/dist/PenPlotterStudio-${{ needs.version.outputs.tag }}-x86_64.exe
+
   release:
-    needs: [build-linux, build-windows]
+    needs: [version, build-linux, build-windows]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - name: Create release
+      - name: Create release ${{ needs.version.outputs.tag }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.run_number }}
-          files: |
-            artifacts/linux-appimage/PenPlotterStudio-x86_64.AppImage
-            artifacts/windows-exe/PenPlotterStudio-x86_64.exe
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.tag }}
           generate_release_notes: true
+          files: |
+            artifacts/linux-appimage/PenPlotterStudio-${{ needs.version.outputs.tag }}-x86_64.AppImage
+            artifacts/windows-exe/PenPlotterStudio-${{ needs.version.outputs.tag }}-x86_64.exe
